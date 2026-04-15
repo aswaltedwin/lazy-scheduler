@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+env/
+venv/
+
+# Google API
+credentials.json
+token.json
+
+# Local Config
+config.json
+
+# Logs
+logs/
