@@ -27,7 +27,7 @@ Designed for the "Productive Procrastinator," LazyScheduler handles the thinking
 ### 2. Installation
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/lazy-scheduler.git
+git clone https://github.com/aswaltedwin/lazy-scheduler.git
 cd lazy-scheduler
 
 # Install dependencies
@@ -52,8 +52,9 @@ You can customize your experience in `config.json`:
 
 Simply run:
 ```bash
-python lazy_scheduler.py
+python main.py
 ```
+
 
 ### Example Commands:
 - *"Schedule a team sync with rahul@gmail.com tomorrow at 3 PM"*

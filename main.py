@@ -11,7 +11,11 @@ from core import (
     parse_natural_language, 
     check_conflicts, 
     find_free_slots, 
-    create_event
+    create_event,
+    list_upcoming_events,
+    find_event,
+    delete_event,
+    update_event
 )
 
 console = Console()
@@ -19,13 +23,18 @@ console = Console()
 def show_event_panel(event: EventDetails, title="Proposed Event"):
     content = f"[bold white]📅 Title   :[/bold white] {event.title}\n"
     content += f"[bold white]🕒 Time    :[/bold white] {event.start[:16].replace('T',' ')} [dim]→[/dim] {event.end[:16].replace('T',' ')}\n"
-    if event.attendees: content += f"[bold white]👥 Invite  :[/bold white] {', '.join(event.attendees)}\n"
-    if event.recurrence: content += f"[bold white]🔄 Repeat  :[/bold white] {event.recurrence[0]}\n"
+    if event.description: content += f"[bold white]📝 Notes   :[/bold white] {event.description}\n"
+    if event.location:    content += f"[bold white]📍 Loc     :[/bold white] {event.location}\n"
+    if event.attendees:   content += f"[bold white]👥 Invite  :[/bold white] {', '.join(event.attendees)}\n"
+    if event.recurrence:  content += f"[bold white]🔄 Repeat  :[/bold white] {event.recurrence[0]}\n"
     if event.add_meeting: content += f"[bold white]📹 Video   :[/bold white] Google Meet Link enabled\n"
     
     console.print(Panel(content, title=f"[bold cyan]{title}[/bold cyan]", border_style="cyan", expand=False))
 
 def show_schedule_table(events):
+    if not events:
+        console.print("[yellow]No upcoming events found.[/yellow]")
+        return
     table = Table(title="Your Schedule", show_header=True, header_style="bold magenta", box=None)
     table.add_column("Time", style="dim", width=12)
     table.add_column("Event")
@@ -42,18 +51,18 @@ def main():
     service = get_calendar_service()
 
     while True:
-        user_input = console.input("\n[bold green]You:[/bold green] ").strip()
-        if user_input.lower() in ['quit', 'exit', 'q']:
-            console.print("[yellow]👋 Stopped.[/yellow]"); break
-        if not user_input: continue
-
         try:
-            # Pass STATE.last_event as context for natural corrections
+            user_input = console.input("\n[bold green]You:[/bold green] ").strip()
+            if user_input.lower() in ['quit', 'exit', 'q']:
+                console.print("[yellow]👋 Stopped.[/yellow]"); break
+            if not user_input: continue
+
+            # Core AI Parsing (passes context for corrections)
             event = parse_natural_language(user_input, context=STATE.last_event)
             
             if event.action == "list":
-                events_result = service.events().list(calendarId='primary', timeMin=event.start, timeMax=event.end, singleEvents=True, orderBy='startTime').execute()
-                show_schedule_table(events_result.get('items', []))
+                items = list_upcoming_events(service, event.start, event.end)
+                show_schedule_table(items)
                 STATE.last_event = None
                 
             elif event.action == "find_slot":
@@ -64,22 +73,23 @@ def main():
                 else: console.print("[yellow]No free slots found.[/yellow]")
                 STATE.last_event = None
                 
-            elif event.action == "delete" or event.action == "update":
-                # Implementation for search and delete/update
-                now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                events = service.events().list(calendarId='primary', q=event.search_query, timeMin=now, maxResults=1).execute().get('items', [])
-                if not events:
+            elif event.action in ["delete", "update"]:
+                matches = find_event(service, event.search_query)
+                if not matches:
                     console.print(f"[yellow]No match found for '{event.search_query}'[/yellow]")
                 else:
-                    target = events[0]
-                    console.print(f"🎯 Found: '{target['summary']}' at {target['start'].get('dateTime')}")
-                    if console.input(f"Confirm {event.action}? (y/n): ").lower() in ['y', 'yes']:
-                        if event.action == "delete": service.events().delete(calendarId='primary', eventId=target['id']).execute()
+                    target = matches[0]
+                    target_start = target['start'].get('dateTime', target['start'].get('date'))
+                    console.print(f"🎯 Found: [bold]{target['summary']}[/bold] at {target_start[:16]}")
+                    
+                    choice = console.input(f"Confirm {event.action}? (y/n): ").lower()
+                    if choice in ['y', 'yes']:
+                        if event.action == "delete": 
+                            delete_event(service, target['id'])
+                            console.print(f"[green]🗑️ Deleted.[/green]")
                         else:
-                            target['start'] = {'dateTime': event.start, 'timeZone': CONFIG.timezone}
-                            target['end'] = {'dateTime': event.end, 'timeZone': CONFIG.timezone}
-                            service.events().update(calendarId='primary', eventId=target['id'], body=target).execute()
-                        console.print(f"[green]Success![/green]")
+                            update_event(service, target['id'], event)
+                            console.print(f"[green]🔄 Updated to new time.[/green]")
                 STATE.last_event = None
                 
             else: # create
@@ -97,7 +107,7 @@ def main():
                 show_event_panel(event)
                 STATE.last_event = event
 
-                choice = console.input("\n[bold white]Create?[/bold white] ([green]y[/green]/[red]n[/red]/correct): ").strip().lower()
+                choice = console.input("\n[bold white]Proceed?[/bold white] ([green]y[/green]/[red]n[/red]/correct): ").strip().lower()
                 if choice in ['y', 'yes']:
                     res = create_event(service, event)
                     console.print(f"[green]✅ Created: [u]{res.get('htmlLink')}[/u][/green]")
@@ -106,9 +116,11 @@ def main():
                     console.print("[yellow]Cancelled.[/yellow]")
                     STATE.last_event = None
                 else:
-                    # User provided a correction, loop again with the new input and previous context
+                    # Treat anything else as a correction for the next loop
                     continue
 
+        except KeyboardInterrupt:
+            console.print("\n[yellow]👋 Goodbye![/yellow]"); break
         except Exception as e:
             console.print(f"[red]❌ Error: {e}[/red]")
 
