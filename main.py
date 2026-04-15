@@ -5,8 +5,10 @@ from rich.panel import Panel
 from rich.table import Table
 
 # Import local modules
-from config import CONFIG, STATE, EventDetails
+from config import CONFIG
 from core import (
+    STATE,
+    EventDetails,
     get_calendar_service, 
     parse_natural_language, 
     check_conflicts, 

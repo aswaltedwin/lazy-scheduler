@@ -5,6 +5,7 @@ import re
 import time
 import uuid
 import ollama
+from pydantic import BaseModel
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -14,8 +15,27 @@ from dateutil import parser, tz
 from rich.console import Console
 
 # Import local configuration
-from config import CONFIG, EventDetails
+from config import CONFIG
 
+# ====================== DATA MODELS ======================
+
+class EventDetails(BaseModel):
+    action: str = "create"
+    title: str = ""
+    start: str = ""
+    end: str = ""
+    description: str = ""
+    location: str = ""
+    attendees: list[str] = []
+    add_meeting: bool = False
+    search_query: str = ""
+    recurrence: list[str] = []
+
+class SessionState:
+    last_event: EventDetails = None
+    last_raw_input: str = ""
+
+STATE = SessionState()
 _console = Console()
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
@@ -35,7 +55,7 @@ def get_calendar_service():
             token.write(creds.to_json())
     return build('calendar', 'v3', credentials=creds)
 
-# ====================== IMPROVED PARSING ======================
+# ====================== CORE LOGIC ======================
 
 def parse_natural_language(text: str, context: EventDetails = None) -> EventDetails:
     today = datetime.datetime.now().strftime('%Y-%m-%d %A')
@@ -124,7 +144,6 @@ def list_upcoming_events(service, start_time: str, end_time: str):
 def find_event(service, search_query: str):
     """Searches for an event starting from the BEGINNING of the current day."""
     try:
-        # Wider window: Search from 00:00 today to 7 days from now
         now = datetime.datetime.now()
         start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone().isoformat()
         
@@ -139,7 +158,6 @@ def delete_event(service, event_id: str):
     return service.events().delete(calendarId='primary', eventId=event_id).execute()
 
 def update_event(service, event_id: str, new_data: EventDetails):
-    # Fetch existing first so we don't wipe description/location
     event = service.events().get(calendarId='primary', eventId=event_id).execute()
     event['summary'] = new_data.title
     event['start'] = {'dateTime': new_data.start, 'timeZone': CONFIG.timezone}
