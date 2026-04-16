@@ -1,4 +1,5 @@
 import datetime
+import logging
 from dateutil import parser
 from rich.console import Console
 from rich.panel import Panel
@@ -17,17 +18,18 @@ from core import (
     list_upcoming_events,
     find_event,
     delete_event,
-    update_event
+    update_event,
+    logger
 )
 
 console = Console()
 
 def show_event_panel(event: EventDetails, title="Proposed Event"):
+    """Displays a formatted panel of the proposed event details."""
     content = f"[bold white]📅 Title    :[/bold white] {event.title}\n"
     content += f"[bold white]🕒 Time     :[/bold white] {event.start[:16].replace('T',' ')} [dim]→[/dim] {event.end[:16].replace('T',' ')}\n"
     if event.description: content += f"[bold white]📝 Notes    :[/bold white] {event.description}\n"
     
-    # Only show location if it's not empty/filler
     loc = event.location.strip()
     if loc and loc.lower() not in ["online", "google meet", "virtual"]:
         content += f"[bold white]📍 Location :[/bold white] {loc}\n"
@@ -42,43 +44,58 @@ def show_event_panel(event: EventDetails, title="Proposed Event"):
     console.print(Panel(content, title=f"[bold cyan]{title}[/bold cyan]", border_style="cyan", expand=False))
 
 def show_schedule_table(events):
+    """Displays user events in a clean ASCII table."""
     if not events:
         console.print("[yellow]No upcoming events found.[/yellow]")
         return
     table = Table(title="Your Schedule", show_header=True, header_style="bold magenta", box=None)
-    table.add_column("Time", style="dim", width=12)
+    table.add_column("Date/Time", style="dim", width=22)
     table.add_column("Event")
     
     for event in events:
-        start = event['start'].get('dateTime', event['start'].get('date'))
-        time_str = parser.parse(start).strftime('%H:%M') if 'T' in start else "All Day"
+        start_raw = event['start'].get('dateTime', event['start'].get('date'))
+        end_raw = event['end'].get('dateTime', event['end'].get('date'))
+        s_dt = parser.parse(start_raw)
+        e_dt = parser.parse(end_raw)
+        
+        date_part = s_dt.strftime('%a, %b %d')
+        if 'T' in start_raw:
+            time_part = f"{s_dt.strftime('%H:%M')} [dim]→[/dim] {e_dt.strftime('%H:%M')}"
+        else:
+            time_part = "All Day"
+            
+        time_str = f"{date_part} [bold]|[/bold] {time_part}"
         table.add_row(time_str, event['summary'])
+
     
     console.print(table)
 
 def main():
+    """Main CLI interaction loop."""
     console.print(Panel(f"Model: [bold cyan]{CONFIG.model}[/bold cyan] | Timezone: [bold magenta]{CONFIG.timezone}[/bold magenta]", title="🐢 [bold]LazyScheduler[/bold]", border_style="green"))
     
     try:
         service = get_calendar_service()
     except Exception as e:
-        console.print(f"[bold red]Failed to connect to Google Calendar:[/bold red] {e}")
+        logger.error(f"Initialization Failed: {e}")
+        console.print(f"[bold red]Critical Error:[/bold red] Could not connect to Google Calendar. See logs.")
         return
 
     while True:
         try:
-            # Visual feedback if we're in the middle of a correction flow
-            prefix = "[bold yellow](Correction)[/bold yellow] " if STATE.last_event else ""
-            prompt_text = f"\n{prefix}[bold green]You:[/bold green] "
-            
-            user_input = console.input(prompt_text).strip()
+            prefix = "[bold yellow]🔨 (Correction Mode)[/bold yellow] " if STATE.last_event else ""
+            user_input = console.input(f"\n{prefix}[bold green]You:[/bold green] ").strip()
             
             if user_input.lower() in ['quit', 'exit', 'q']:
                 console.print("[yellow]👋 Stopped.[/yellow]"); break
             if not user_input: continue
 
-            # Core AI Parsing (passes context for corrections)
-            event = parse_natural_language(user_input, context=STATE.last_event)
+            # Core AI Parsing
+            try:
+                event = parse_natural_language(user_input, context=STATE.last_event)
+            except ValueError as ve:
+                console.print(f"[bold red]Parsing Error:[/bold red] {ve}")
+                continue
             
             if event.action == "list":
                 items = list_upcoming_events(service, event.start, event.end)
@@ -86,12 +103,20 @@ def main():
                 STATE.last_event = None
                 
             elif event.action == "find_slot":
-                slots = find_free_slots(service, event.start)
-                if slots:
-                    console.print("\n🆓 [bold]Available Free Slots:[/bold]")
-                    for i, s in enumerate(slots): console.print(f"   {i+1}. {s.strftime('%Y-%m-%d %H:%M')}")
-                else: console.print("[yellow]No free slots found.[/yellow]")
+                # Find all free blocks, using the duration explicitly requested (if any)
+                blocks = find_free_slots(service, event.start, min_duration_mins=event.duration_mins)
+
+                if blocks:
+                    console.print(f"\n🆓 [bold]Your Availability:[/bold]")
+                    for i, (s, e) in enumerate(blocks):
+                        dur = e - s
+                        hours, remainder = divmod(int(dur.total_seconds() / 60), 60)
+                        dur_str = f"{hours}h {remainder}m" if hours > 0 else f"{remainder}m"
+                        console.print(f"   {i+1}. {s.strftime('%a, %b %d')}: {s.strftime('%H:%M')} [dim]→[/dim] {e.strftime('%H:%M')} [bold cyan]({dur_str} free)[/bold cyan]")
+                else:
+                    console.print("[yellow]No free blocks found.[/yellow]")
                 STATE.last_event = None
+
                 
             elif event.action in ["delete", "update"]:
                 matches = find_event(service, event.search_query)
@@ -102,9 +127,8 @@ def main():
                     target_start = target['start'].get('dateTime', target['start'].get('date'))
                     console.print(f"🎯 Found: [bold]{target['summary']}[/bold] at {target_start[:16]}")
                     
-                    confirm_prompt = "Update this event? (y/n): " if event.action == "update" else "Delete this event? (y/n): "
-                    choice = console.input(confirm_prompt).lower()
-                    if choice in ['y', 'yes']:
+                    prompt = "Update this event? (y/n): " if event.action == "update" else "Delete this event? (y/n): "
+                    if console.input(prompt).lower() in ['y', 'yes']:
                         if event.action == "delete": 
                             delete_event(service, target['id'])
                             console.print(f"[green]🗑️ Deleted successfully.[/green]")
@@ -116,14 +140,15 @@ def main():
             else: # create action
                 busy = check_conflicts(service, event.start, event.end)
                 if busy:
-                    console.print("\n[bold red]⚠️ CONFLICT:[/bold red] You are already busy during this time!")
+                    console.print("\n[bold red]⚠️ CONFLICT:[/bold red] You are already busy!")
                     suggestions = find_free_slots(service, event.start)
                     if suggestions:
-                        suggestion = suggestions[0]
-                        console.print(f"👉 Next free slot: [bold]{suggestion.strftime('%Y-%m-%d %H:%M')}[/bold]")
+                        s_start, s_end = suggestions[0]
+                        console.print(f"👉 Next free block: [bold]{s_start.strftime('%a, %b %d at %H:%M')} [dim]→[/dim] {s_end.strftime('%H:%M')}[/bold]")
                         if console.input("\nSwitch to this time? (y/n): ").strip().lower() in ['y', 'yes']:
+
                             dur = parser.parse(event.end) - parser.parse(event.start)
-                            event.start, event.end = suggestion.isoformat(), (suggestion + dur).isoformat()
+                            event.start, event.end = s_start.isoformat(), (s_start + dur).isoformat()
 
                 show_event_panel(event)
                 STATE.last_event = event
@@ -132,24 +157,10 @@ def main():
                 if choice in ['y', 'yes']:
                     res = create_event(service, event)
                     if res:
-                        # Success Message logic
                         msg = "[green]✅ Event Created![/green]\n"
-                        
-                        # Extract Meet link if present
-                        meet_link = None
-                        conf = res.get('conferenceData', {})
-                        for ep in conf.get('entryPoints', []):
-                            if ep.get('entryPointType') == 'video':
-                                meet_link = ep.get('uri')
-                                break
-                        
-                        if meet_link:
-                            msg += f"📹 [bold cyan]Google Meet:[/bold cyan] [u]{meet_link}[/u]\n"
-                        
-                        cal_link = res.get('htmlLink')
-                        if cal_link:
-                            msg += f"📅 [dim]Calendar Link: {cal_link}[/dim]"
-                            
+                        meet_link = next((ep.get('uri') for ep in res.get('conferenceData', {}).get('entryPoints', []) if ep.get('entryPointType') == 'video'), None)
+                        if meet_link: msg += f"📹 [bold cyan]Google Meet:[/bold cyan] [u]{meet_link}[/u]\n"
+                        if res.get('htmlLink'): msg += f"📅 [dim]Calendar Link: {res.get('htmlLink')}[/dim]"
                         console.print(Panel(msg, border_style="green", expand=False))
                     else:
                         console.print("[red]❌ Failed to create event.[/red]")
@@ -164,7 +175,8 @@ def main():
         except KeyboardInterrupt:
             console.print("\n[yellow]👋 Goodbye![/yellow]"); break
         except Exception as e:
-            console.print(f"[red]❌ Error: {e}[/red]")
+            logger.error(f"Runtime Exception: {e}", exc_info=True)
+            console.print(f"[bold red]Unexpected Error:[/bold red] Check logs for details.")
             STATE.last_event = None
 
 if __name__ == "__main__":
