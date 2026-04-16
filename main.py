@@ -53,11 +53,21 @@ def show_schedule_table(events):
 
 def main():
     console.print(Panel(f"Model: [bold cyan]{CONFIG.model}[/bold cyan] | Timezone: [bold magenta]{CONFIG.timezone}[/bold magenta]", title="🐢 [bold]LazyScheduler[/bold]", border_style="green"))
-    service = get_calendar_service()
+    
+    try:
+        service = get_calendar_service()
+    except Exception as e:
+        console.print(f"[bold red]Failed to connect to Google Calendar:[/bold red] {e}")
+        return
 
     while True:
         try:
-            user_input = console.input("\n[bold green]You:[/bold green] ").strip()
+            # Visual feedback if we're in the middle of a correction flow
+            prefix = "[bold yellow](Correction)[/bold yellow] " if STATE.last_event else ""
+            prompt_text = f"\n{prefix}[bold green]You:[/bold green] "
+            
+            user_input = console.input(prompt_text).strip()
+            
             if user_input.lower() in ['quit', 'exit', 'q']:
                 console.print("[yellow]👋 Stopped.[/yellow]"); break
             if not user_input: continue
@@ -87,21 +97,21 @@ def main():
                     target_start = target['start'].get('dateTime', target['start'].get('date'))
                     console.print(f"🎯 Found: [bold]{target['summary']}[/bold] at {target_start[:16]}")
                     
-                    choice = console.input(f"Confirm {event.action}? (y/n): ").lower()
+                    confirm_prompt = "Update this event? (y/n): " if event.action == "update" else "Delete this event? (y/n): "
+                    choice = console.input(confirm_prompt).lower()
                     if choice in ['y', 'yes']:
                         if event.action == "delete": 
                             delete_event(service, target['id'])
-                            console.print(f"[green]🗑️ Deleted.[/green]")
+                            console.print(f"[green]🗑️ Deleted successfully.[/green]")
                         else:
-                            # For updates, we use the 'event' object parsed by the AI
                             update_event(service, target['id'], event)
-                            console.print(f"[green]🔄 Updated to new details.[/green]")
+                            console.print(f"[green]🔄 Updated successfully.[/green]")
                 STATE.last_event = None
                 
-            else: # create
+            else: # create action
                 busy = check_conflicts(service, event.start, event.end)
                 if busy:
-                    console.print("\n[bold red]⚠️ CONFLICT:[/bold red] You are already busy!")
+                    console.print("\n[bold red]⚠️ CONFLICT:[/bold red] You are already busy during this time!")
                     suggestions = find_free_slots(service, event.start)
                     if suggestions:
                         suggestion = suggestions[0]
@@ -116,19 +126,27 @@ def main():
                 choice = console.input("\n[bold white]Proceed?[/bold white] ([green]y[/green]/[red]n[/red]/correct): ").strip().lower()
                 if choice in ['y', 'yes']:
                     res = create_event(service, event)
-                    console.print(f"[green]✅ Created: [u]{res.get('htmlLink')}[/u][/green]")
+                    if res and 'htmlLink' in res:
+                        console.print(f"[green]✅ Created: [u]{res.get('htmlLink')}[/u][/green]")
+                    else:
+                        console.print("[green]✅ Created, but could not retrieve link.[/green]")
                     STATE.last_event = None
                 elif choice in ['n', 'no']:
                     console.print("[yellow]Cancelled.[/yellow]")
                     STATE.last_event = None
                 else:
-                    # Treat anything else as a correction for the next loop
+                    # Anything else is a refinement/correction.
+                    # We 'continue' the loop, and the next 'parse_natural_language' call 
+                    # will use STATE.last_event as context.
+                    console.print("[dim italic]Processing correction...[/dim italic]")
                     continue
 
         except KeyboardInterrupt:
             console.print("\n[yellow]👋 Goodbye![/yellow]"); break
         except Exception as e:
             console.print(f"[red]❌ Error: {e}[/red]")
+            # Important: Clear state on error to prevent broken context loops
+            STATE.last_event = None
 
 if __name__ == "__main__":
     main()

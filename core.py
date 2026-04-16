@@ -115,19 +115,32 @@ RULES:
     # Timezone-aware datetime parsing
     local_tz = tz.gettz(CONFIG.timezone)
     
-    def finalize_dt(dt_str, base_dt=None):
+    def finalize_dt(dt_str):
         if not dt_str: return None
-        parsed = parser.parse(dt_str)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=local_tz)
-        return parsed
+        try:
+            parsed = parser.parse(dt_str)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=local_tz)
+            return parsed
+        except: return None
 
-    start_dt = finalize_dt(data.get('start')) or now_dt.replace(tzinfo=local_tz)
+    # Fallback logic to prevent empty start/end on 'list' or 'create'
+    start_dt = finalize_dt(data.get('start'))
+    if not start_dt:
+        if data.get('action') == 'list':
+            # Default 'list' to current day
+            start_dt = now_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=local_tz)
+        else:
+            start_dt = now_dt.replace(tzinfo=local_tz)
     
     if data.get('end'):
-        end_dt = finalize_dt(data['end'])
+        end_dt = finalize_dt(data['end']) or (start_dt + datetime.timedelta(minutes=CONFIG.default_duration))
     else:
-        end_dt = start_dt + datetime.timedelta(minutes=CONFIG.default_duration)
+        if data.get('action') == 'list':
+            # Default 'list' end to end of day
+            end_dt = start_dt.replace(hour=23, minute=59, second=59)
+        else:
+            end_dt = start_dt + datetime.timedelta(minutes=CONFIG.default_duration)
 
     if end_dt <= start_dt:
         end_dt = start_dt + datetime.timedelta(minutes=CONFIG.default_duration)
