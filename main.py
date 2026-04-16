@@ -171,23 +171,44 @@ def main():
                     magic_proposal = get_magic_fix_proposal(service, event, busy)
                     applied_fix = False
                     if magic_proposal:
+                        from rich.table import Table
                         targets = magic_proposal['targets']
-                        summary_msg = f"Wizard: I can move " + ", ".join([f"[italic]'{t['summary']}'[/italic]" for t in targets])
-                        console.print(f"🧙 [bold cyan]Magic Fix Available:[/bold cyan] {summary_msg} to make room.")
-                        console.print(f"   [dim]Reason: {magic_proposal['reason']}[/dim]")
                         
+                        table = Table(title="🧙 Magic Fix: Schedule Impact Preview", title_style="bold cyan", border_style="dim")
+                        table.add_column("Event", style="bold white")
+                        table.add_column("Original Time", style="dim")
+                        table.add_column("Proposed New Time", style="green")
+                        table.add_column("Shift", justify="right")
+                        table.add_column("Cost", justify="right")
+                        
+                        total_cost = 0
                         for t in targets:
-                            console.print(f"   📍 [bold]{t['summary']}[/bold]: {t['old_start'].strftime('%H:%M')} [dim]→[/dim] [green]{t['new_start'].strftime('%H:%M')}[/green]")
+                            shift_mins = int((t['new_start'] - t['old_start']).total_seconds() / 60)
+                            cost = _calculate_move_cost({'summary': t['summary'], 'priority': 2, 'start': {'dateTime': t['old_start'].isoformat()}, 'end': {'dateTime': t['old_start'].isoformat()}}, t['old_start'], t['new_start']) # Simplified for display
+                            total_cost += cost
+                            table.add_row(
+                                t['summary'],
+                                t['old_start'].strftime("%H:%M"),
+                                t['new_start'].strftime("%H:%M"),
+                                f"{shift_mins}m",
+                                f"{int(cost)}"
+                            )
                         
-                        if console.input("\n   [white]Apply these shifts? (y/n): [/white]").strip().lower() in ['y', 'yes', '']:
+                        console.print(table)
+                        console.print(f"   [dim]Strategy: {magic_proposal['reason']}[/dim]")
+                        console.print(f"   [italic]Total Disruption Cost: [bold white]{int(magic_proposal['cost'])}[/bold white][/italic]\n")
+                        
+                        if console.input("   [white]Apply these shifts to make room? (y/n): [/white]").strip().lower() in ['y', 'yes', '']:
+                            console.print("   [dim]Applying atomic transaction...[/dim]")
                             for t in targets:
                                 update_event(service, t['id'], EventDetails(
                                     action="update",
                                     start=t['new_start'].isoformat(),
                                     end=t['new_end'].isoformat()
                                 ))
-                            console.print(f"[green]✨ Shifted {len(targets)} event(s) successfully.[/green]")
+                            console.print(f"   [green]✨ Successfully shifted {len(targets)} event(s).[/green]")
                             applied_fix = True
+
 
 
                     
