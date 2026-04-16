@@ -146,17 +146,19 @@ def main():
                     
                     # Try Magic Fix
                     magic_proposal = get_magic_fix_proposal(service, event, busy)
+                    applied_fix = False
                     if magic_proposal:
                         console.print(f"🧙 [bold cyan]Magic Fix Available:[/bold cyan] I can move [italic]'{magic_proposal['target_summary']}'[/italic] to [bold]{magic_proposal['new_start'].strftime('%H:%M')}[/bold] to make room.")
                         if console.input("   [white]Apply Magic Fix? (y/n): [/white]").strip().lower() in ['y', 'yes']:
-                            # Execute the move
                             update_event(service, magic_proposal['target_id'], EventDetails(
                                 action="update",
                                 start=magic_proposal['new_start'].isoformat(),
                                 end=magic_proposal['new_end'].isoformat()
                             ))
                             console.print(f"[green]✨ Shifted '{magic_proposal['target_summary']}' successfully.[/green]")
-                    else:
+                            applied_fix = True
+                    
+                    if not applied_fix:
                         suggestions = find_free_slots(service, event.start)
                         if suggestions:
                             s_start, s_end = suggestions[0]
@@ -164,6 +166,7 @@ def main():
                             if console.input("\nSwitch to this time? (y/n): ").strip().lower() in ['y', 'yes']:
                                 dur = parser.parse(event.end) - parser.parse(event.start)
                                 event.start, event.end = s_start.isoformat(), (s_start + dur).isoformat()
+
 
                 show_event_panel(event)
                 STATE.last_event = event
