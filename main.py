@@ -171,15 +171,25 @@ def main():
                     magic_proposal = get_magic_fix_proposal(service, event, busy)
                     applied_fix = False
                     if magic_proposal:
-                        console.print(f"🧙 [bold cyan]Magic Fix Available:[/bold cyan] I can move [italic]'{magic_proposal['target_summary']}'[/italic] to [bold]{magic_proposal['new_start'].strftime('%H:%M')}[/bold] to make room.")
-                        if console.input("   [white]Apply Magic Fix? (y/n): [/white]").strip().lower() in ['y', 'yes']:
-                            update_event(service, magic_proposal['target_id'], EventDetails(
-                                action="update",
-                                start=magic_proposal['new_start'].isoformat(),
-                                end=magic_proposal['new_end'].isoformat()
-                            ))
-                            console.print(f"[green]✨ Shifted '{magic_proposal['target_summary']}' successfully.[/green]")
+                        targets = magic_proposal['targets']
+                        summary_msg = f"Wizard: I can move " + ", ".join([f"[italic]'{t['summary']}'[/italic]" for t in targets])
+                        console.print(f"🧙 [bold cyan]Magic Fix Available:[/bold cyan] {summary_msg} to make room.")
+                        console.print(f"   [dim]Reason: {magic_proposal['reason']}[/dim]")
+                        
+                        for t in targets:
+                            console.print(f"   📍 [bold]{t['summary']}[/bold]: {t['old_start'].strftime('%H:%M')} [dim]→[/dim] [green]{t['new_start'].strftime('%H:%M')}[/green]")
+                        
+                        if console.input("\n   [white]Apply these shifts? (y/n): [/white]").strip().lower() in ['y', 'yes', '']:
+                            for t in targets:
+                                update_event(service, t['id'], EventDetails(
+                                    action="update",
+                                    start=t['new_start'].isoformat(),
+                                    end=t['new_end'].isoformat()
+                                ))
+                            console.print(f"[green]✨ Shifted {len(targets)} event(s) successfully.[/green]")
                             applied_fix = True
+
+
                     
                     if not applied_fix:
                         suggestions = find_free_slots(service, event.start)

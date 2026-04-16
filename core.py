@@ -359,34 +359,121 @@ def _eval_priority(summary: str) -> int:
     if any(k in summary for k in ["gym", "lunch", "coffee", "break", "personal", "workout"]): return 1
     return 2
 
+def _calculate_move_cost(event, original_start, new_start):
+    """Calculates the 'pain' cost of moving an event. Lower is better."""
+    priority = _eval_priority(event.get('summary', ''))
+    duration_mins = (parser.parse(event['end'].get('dateTime', event['end'].get('date'))) - 
+                     parser.parse(event['start'].get('dateTime', event['start'].get('date')))).total_seconds() / 60
+    
+    shift_hours = abs((new_start - original_start).total_seconds()) / 3600
+    
+    # Priority is most important (x20), then shift distance (x5), then duration (x0.1)
+    return (priority * 20) + (shift_hours * 5) + (duration_mins * 0.1)
+
 def get_magic_fix_proposal(service, new_event: EventDetails, conflicts: list):
-    """Checks if a 'Magic Fix' (auto-reschedule) is possible."""
+    """Checks if a 'Master Class' Magic Fix (auto-reschedule) is possible."""
     if not conflicts: return None
     
-    # Check if all conflicts are lower priority
-    can_bump = True
+    # Step 1: Identify movable events
+    movable = []
     for c in conflicts:
-        p = _eval_priority(c.get('summary', ''))
-        if p >= new_event.priority:
-            can_bump = False; break
+        if _eval_priority(c.get('summary', '')) < new_event.priority:
+            movable.append(c)
+        else:
+            # If even one conflict is higher priority, we can't 'Fix' it
+            return None
             
-    if not can_bump: return None
+    if len(movable) < len(conflicts): return None
     
-    # Propose moving the FIRST conflict to the next gap
-    target = conflicts[0]
-    duration = parser.parse(target['end']['dateTime']) - parser.parse(target['start']['dateTime'])
+    # Step 2: Try single-move solutions first (most common)
+    proposals = []
+    for target in movable:
+        t_s = parser.parse(target['start'].get('dateTime', target['start'].get('date')))
+        t_e = parser.parse(target['end'].get('dateTime', target['end'].get('date')))
+        dur = int((t_e - t_s).total_seconds() / 60)
+        
+        # KEY FIX: Before proposing a single move, ensure it resolves the whole block
+        # (i.e. if there were 2 conflicts, moving one isn't enough)
+        if len(conflicts) > 1:
+            # We skip single-move proposals if multiple items overlap the window
+            # and they aren't all the same event
+            pass # We'll let the multi-move logic handle it below
+        else:
+            # Find multiple possible slots
+            suggestions = find_free_slots(service, new_event.end, min_duration_mins=dur)
+            for slot_start, slot_end in suggestions[:3]:
+                if check_conflicts(service, slot_start.isoformat(), slot_end.isoformat()):
+                    continue
+                    
+                cost = _calculate_move_cost(target, t_s, slot_start)
+                if (slot_start - t_s).total_seconds() / 3600 > 6:
+                    continue
+                    
+                proposals.append({
+                    "targets": [{
+                        "id": target['id'],
+                        "summary": target['summary'],
+                        "new_start": slot_start,
+                        "new_end": slot_end,
+                        "old_start": t_s
+                    }],
+                    "cost": cost,
+                    "reason": f"Optimal single move (Shift: {int((slot_start - t_s).total_seconds()/60)}m, Prio: {_eval_priority(target['summary'])})"
+                })
+
+    # Step 3: Try multi-move solution (Chain Fix)
+    if len(movable) > 1:
+        # Move all conflicts to the same next large gap
+        total_dur = sum((parser.parse(c['end'].get('dateTime', c['end'].get('date'))) - 
+                        parser.parse(c['start'].get('dateTime', c['start'].get('date')))).total_seconds() / 60 for c in movable)
+        
+        combined_suggestions = find_free_slots(service, new_event.end, min_duration_mins=int(total_dur))
+        if combined_suggestions:
+            s_start, _ = combined_suggestions[0]
+            current_ptr = s_start
+            multi_targets = []
+            valid_multi = True
+            for target in movable:
+                t_s = parser.parse(target['start'].get('dateTime', target['start'].get('date')))
+                t_e = parser.parse(target['end'].get('dateTime', target['end'].get('date')))
+                t_dur = t_e - t_s
+                
+                new_t_s = current_ptr
+                new_t_e = current_ptr + t_dur
+                
+                if (new_t_s - t_s).total_seconds() / 3600 > 6:
+                    valid_multi = False; break
+                
+                # Simulation: Check if this sub-slot is free
+                if check_conflicts(service, new_t_s.isoformat(), new_t_e.isoformat()):
+                     valid_multi = False; break
+
+                multi_targets.append({
+                    "id": target['id'],
+                    "summary": target['summary'],
+                    "new_start": new_t_s,
+                    "new_end": new_t_e,
+                    "old_start": t_s
+                })
+                current_ptr = new_t_e
+            
+            if valid_multi:
+                # Calculate aggregate cost
+                total_cost = sum(_calculate_move_cost(c, parser.parse(c['start'].get('dateTime', c['start'].get('date'))), mt['new_start']) 
+                               for c, mt in zip(movable, multi_targets))
+                proposals.append({
+                    "targets": multi_targets,
+                    "cost": (total_cost / len(movable)) + 5, # Small penalty for complexity
+                    "reason": f"Chain Fix: Displaced {len(movable)} low-prio events for optimal room"
+                })
+
+
+    if not proposals: return None
     
-    # Find next gap for the bumped event
-    suggestions = find_free_slots(service, new_event.end, min_duration_mins=int(duration.total_seconds() / 60))
-    if suggestions:
-        s_start, s_end = suggestions[0]
-        return {
-            "target_id": target['id'],
-            "target_summary": target['summary'],
-            "new_start": s_start,
-            "new_end": s_end
-        }
-    return None
+    # Return the proposal with the MINIMUM cost
+    best_prop = min(proposals, key=lambda p: p['cost'])
+    return best_prop
+
 
 def find_free_slots(service, start_search: str, min_duration_mins=None):
     try:
