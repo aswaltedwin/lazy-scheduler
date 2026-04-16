@@ -26,13 +26,18 @@ def show_event_panel(event: EventDetails, title="Proposed Event"):
     content = f"[bold white]📅 Title    :[/bold white] {event.title}\n"
     content += f"[bold white]🕒 Time     :[/bold white] {event.start[:16].replace('T',' ')} [dim]→[/dim] {event.end[:16].replace('T',' ')}\n"
     if event.description: content += f"[bold white]📝 Notes    :[/bold white] {event.description}\n"
-    if event.location:    content += f"[bold white]📍 Location :[/bold white] {event.location}\n"
+    
+    # Only show location if it's not empty/filler
+    loc = event.location.strip()
+    if loc and loc.lower() not in ["online", "google meet", "virtual"]:
+        content += f"[bold white]📍 Location :[/bold white] {loc}\n"
+        
     if event.attendees:   content += f"[bold white]👥 Invite   :[/bold white] {', '.join(event.attendees)}\n"
     if event.reminders_minutes: 
         rem_str = ", ".join([f"{m}m" for m in event.reminders_minutes])
         content += f"[bold white]🔔 Alarms   :[/bold white] {rem_str} before\n"
     if event.recurrence:  content += f"[bold white]🔄 Repeat   :[/bold white] {event.recurrence[0]}\n"
-    if event.add_meeting: content += f"[bold white]📹 Video    :[/bold white] Google Meet Link enabled\n"
+    if event.add_meeting: content += f"[bold white]📹 Video    :[/bold white] Google Meet Link will be generated\n"
     
     console.print(Panel(content, title=f"[bold cyan]{title}[/bold cyan]", border_style="cyan", expand=False))
 
@@ -126,18 +131,33 @@ def main():
                 choice = console.input("\n[bold white]Proceed?[/bold white] ([green]y[/green]/[red]n[/red]/correct): ").strip().lower()
                 if choice in ['y', 'yes']:
                     res = create_event(service, event)
-                    if res and 'htmlLink' in res:
-                        console.print(f"[green]✅ Created: [u]{res.get('htmlLink')}[/u][/green]")
+                    if res:
+                        # Success Message logic
+                        msg = "[green]✅ Event Created![/green]\n"
+                        
+                        # Extract Meet link if present
+                        meet_link = None
+                        conf = res.get('conferenceData', {})
+                        for ep in conf.get('entryPoints', []):
+                            if ep.get('entryPointType') == 'video':
+                                meet_link = ep.get('uri')
+                                break
+                        
+                        if meet_link:
+                            msg += f"📹 [bold cyan]Google Meet:[/bold cyan] [u]{meet_link}[/u]\n"
+                        
+                        cal_link = res.get('htmlLink')
+                        if cal_link:
+                            msg += f"📅 [dim]Calendar Link: {cal_link}[/dim]"
+                            
+                        console.print(Panel(msg, border_style="green", expand=False))
                     else:
-                        console.print("[green]✅ Created, but could not retrieve link.[/green]")
+                        console.print("[red]❌ Failed to create event.[/red]")
                     STATE.last_event = None
                 elif choice in ['n', 'no']:
                     console.print("[yellow]Cancelled.[/yellow]")
                     STATE.last_event = None
                 else:
-                    # Anything else is a refinement/correction.
-                    # We 'continue' the loop, and the next 'parse_natural_language' call 
-                    # will use STATE.last_event as context.
                     console.print("[dim italic]Processing correction...[/dim italic]")
                     continue
 
@@ -145,7 +165,6 @@ def main():
             console.print("\n[yellow]👋 Goodbye![/yellow]"); break
         except Exception as e:
             console.print(f"[red]❌ Error: {e}[/red]")
-            # Important: Clear state on error to prevent broken context loops
             STATE.last_event = None
 
 if __name__ == "__main__":

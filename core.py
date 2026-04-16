@@ -97,11 +97,14 @@ EXAMPLES:
 1. "Meet John at Starbucks tomorrow at 2pm" -> {{"action": "create", "title": "Coffee with John", "start": "2026-04-17T14:00:00", "location": "Starbucks"}}
 2. "Cancel my dentist appointment" -> {{"action": "delete", "search_query": "dentist"}}
 3. "Move team sync to 5 PM" -> {{"action": "update", "search_query": "team sync", "start": "2026-04-16T17:00:00"}}
+4. "Lunch with parents online" -> {{"action": "create", "title": "Lunch with parents", "add_meeting": true, "location": ""}}
 
 RULES:
 - If duration is missing, default to {CONFIG.default_duration} minutes.
 - If 'action' is update/delete, provide a 'search_query'.
 - "This [Day]" always refers to the upcoming occurrence of that day.
+- ONLINE MEETINGS: If user mentions "online", "virtual", "video call", "google meet", or "zoom", set "add_meeting" to true.
+- LOCATION: If "add_meeting" is true, do NOT put "Google Meet" or "Online" in the location field. Leave it empty unless a physical place is also mentioned.
 - Return ONLY the JSON object. No prose.
 """
     
@@ -185,9 +188,6 @@ RULES:
         recurrence=data.get('recurrence', []),
         reminders_minutes=data.get('reminders_minutes', [15])
     )
-
-# ... (rest of the file remains unchanged)
-# I will copy the rest to ensure it works correctly
 
 def list_upcoming_events(service, start_time: str, end_time: str):
     try:
