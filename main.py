@@ -23,13 +23,16 @@ from core import (
 console = Console()
 
 def show_event_panel(event: EventDetails, title="Proposed Event"):
-    content = f"[bold white]📅 Title   :[/bold white] {event.title}\n"
-    content += f"[bold white]🕒 Time    :[/bold white] {event.start[:16].replace('T',' ')} [dim]→[/dim] {event.end[:16].replace('T',' ')}\n"
-    if event.description: content += f"[bold white]📝 Notes   :[/bold white] {event.description}\n"
-    if event.location:    content += f"[bold white]📍 Loc     :[/bold white] {event.location}\n"
-    if event.attendees:   content += f"[bold white]👥 Invite  :[/bold white] {', '.join(event.attendees)}\n"
-    if event.recurrence:  content += f"[bold white]🔄 Repeat  :[/bold white] {event.recurrence[0]}\n"
-    if event.add_meeting: content += f"[bold white]📹 Video   :[/bold white] Google Meet Link enabled\n"
+    content = f"[bold white]📅 Title    :[/bold white] {event.title}\n"
+    content += f"[bold white]🕒 Time     :[/bold white] {event.start[:16].replace('T',' ')} [dim]→[/dim] {event.end[:16].replace('T',' ')}\n"
+    if event.description: content += f"[bold white]📝 Notes    :[/bold white] {event.description}\n"
+    if event.location:    content += f"[bold white]📍 Location :[/bold white] {event.location}\n"
+    if event.attendees:   content += f"[bold white]👥 Invite   :[/bold white] {', '.join(event.attendees)}\n"
+    if event.reminders_minutes: 
+        rem_str = ", ".join([f"{m}m" for m in event.reminders_minutes])
+        content += f"[bold white]🔔 Alarms   :[/bold white] {rem_str} before\n"
+    if event.recurrence:  content += f"[bold white]🔄 Repeat   :[/bold white] {event.recurrence[0]}\n"
+    if event.add_meeting: content += f"[bold white]📹 Video    :[/bold white] Google Meet Link enabled\n"
     
     console.print(Panel(content, title=f"[bold cyan]{title}[/bold cyan]", border_style="cyan", expand=False))
 
@@ -90,8 +93,9 @@ def main():
                             delete_event(service, target['id'])
                             console.print(f"[green]🗑️ Deleted.[/green]")
                         else:
+                            # For updates, we use the 'event' object parsed by the AI
                             update_event(service, target['id'], event)
-                            console.print(f"[green]🔄 Updated to new time.[/green]")
+                            console.print(f"[green]🔄 Updated to new details.[/green]")
                 STATE.last_event = None
                 
             else: # create

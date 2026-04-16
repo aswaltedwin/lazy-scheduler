@@ -5,12 +5,11 @@ import re
 import time
 import uuid
 import ollama
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from dateutil import parser, tz
 from rich.console import Console
 
@@ -20,16 +19,17 @@ from config import CONFIG
 # ====================== DATA MODELS ======================
 
 class EventDetails(BaseModel):
-    action: str = "create"
-    title: str = ""
-    start: str = ""
-    end: str = ""
-    description: str = ""
-    location: str = ""
-    attendees: list[str] = []
-    add_meeting: bool = False
-    search_query: str = ""
-    recurrence: list[str] = []
+    action: str = Field(..., description="Action to perform: create, list, delete, update, find_slot")
+    title: str = Field("", description="Summarized title of the event")
+    start: str = Field("", description="ISO format start time")
+    end: str = Field("", description="ISO format end time")
+    description: str = Field("", description="Detailed notes or description")
+    location: str = Field("", description="Physical or virtual location")
+    attendees: list[str] = Field(default_factory=list, description="List of email addresses")
+    add_meeting: bool = Field(False, description="Whether to add a Google Meet link")
+    search_query: str = Field("", description="Query string for finding events to delete or update")
+    recurrence: list[str] = Field(default_factory=list, description="RFC5545 RRULE string")
+    reminders_minutes: list[int] = Field(default_factory=lambda: [15], description="Minutes before event for popup reminders")
 
 class SessionState:
     last_event: EventDetails = None
@@ -58,79 +58,118 @@ def get_calendar_service():
 # ====================== CORE LOGIC ======================
 
 def parse_natural_language(text: str, context: EventDetails = None) -> EventDetails:
-    today = datetime.datetime.now().strftime('%Y-%m-%d %A')
-    context_str = ""
-    if context:
-        context_str = f"\nUser previously proposed: {context.json()}\nNow says: \"{text}\". If it's a correction, update the JSON. If new request, start fresh."
+    """Uses Ollama to parse natural language into a structured EventDetails object."""
+    now_dt = datetime.datetime.now()
+    today_str = now_dt.strftime('%Y-%m-%d %A')
+    
+    system_prompt = f"""You are LazyScheduler, a high-performance calendar assistant. 
+Today is {today_str}. The user's timezone is {CONFIG.timezone}.
 
-    prompt = f"""You are LazyScheduler, a smart calendar assistant.{context_str}
-Return ONLY valid JSON. Rules: Today is {today}. Timezone is {CONFIG.timezone}.
+TASK: Convert user requests into a clean JSON object. 
+If the user provides a correction (e.g. "No, make it 5 PM"), use the 'context' provided below to update the values.
 
-JSON structure:
+JSON SCHEMA:
 {{
-  "action": "create | list | delete | update | find_slot",
-  "title": "{context.title if context else 'Short title'}",
-  "start": "2026-04-16T16:00:00",
-  "end": "2026-04-16T16:45:00",
-  "description": "",
-  "location": "",
-  "attendees": [],
-  "add_meeting": true | false,
-  "search_query": "event name",
-  "recurrence": []
+  "action": "create" | "list" | "delete" | "update" | "find_slot",
+  "title": "string",
+  "start": "ISO8601 string",
+  "end": "ISO8601 string",
+  "description": "string",
+  "location": "string",
+  "attendees": ["email@domain.com", "name without email"],
+  "add_meeting": boolean,
+  "search_query": "string (used for delete/update search)",
+  "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+  "reminders_minutes": [integer]
 }}
+
+EXAMPLES:
+1. "Meet John at Starbucks tomorrow at 2pm" -> {{"action": "create", "title": "Coffee with John", "start": "2026-04-17T14:00:00", "location": "Starbucks"}}
+2. "Cancel my dentist appointment" -> {{"action": "delete", "search_query": "dentist"}}
+3. "Move team sync to 5 PM" -> {{"action": "update", "search_query": "team sync", "start": "2026-04-16T17:00:00"}}
+4. "Show me my day" -> {{"action": "list", "start": "2026-04-16T00:00:00", "end": "2026-04-16T23:59:59"}}
+
+RULES:
+- If duration is missing, default to {CONFIG.default_duration} minutes.
+- If 'action' is update/delete, always provide a 'search_query'.
+- Return ONLY the JSON object. No prose.
 """
-    with _console.status(f"[bold yellow]Thinking with {CONFIG.model}...", spinner="dots"):
-        response = ollama.chat(model=CONFIG.model, messages=[{'role': 'user', 'content': prompt + f'\nRequest: "{text}"'}], format='json')
-    data = json.loads(response['message']['content'])
+    
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    if context:
+        messages.append({"role": "assistant", "content": f"Context: {context.json()}"})
+        messages.append({"role": "user", "content": f"Correction: {text}"})
+    else:
+        messages.append({"role": "user", "content": text})
 
-    # Datetime handling
-    start_dt = parser.parse(data['start'])
+    with _console.status(f"[bold yellow]Analyzing intent with {CONFIG.model}...", spinner="dots"):
+        response = ollama.chat(model=CONFIG.model, messages=messages, format='json')
+    
+    try:
+        data = json.loads(response['message']['content'])
+    except Exception as e:
+        _console.print(f"[red]Error parsing LLM response: {e}[/red]")
+        raise ValueError("Invalid AI response")
+
+    # Timezone-aware datetime parsing
     local_tz = tz.gettz(CONFIG.timezone)
-    if start_dt.tzinfo is None: start_dt = start_dt.replace(tzinfo=local_tz)
+    
+    def finalize_dt(dt_str, base_dt=None):
+        if not dt_str: return None
+        parsed = parser.parse(dt_str)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=local_tz)
+        return parsed
 
+    start_dt = finalize_dt(data.get('start')) or now_dt.replace(tzinfo=local_tz)
+    
     if data.get('end'):
-        end_dt = parser.parse(data['end'])
-        if end_dt.tzinfo is None: end_dt = end_dt.replace(tzinfo=local_tz)
+        end_dt = finalize_dt(data['end'])
     else:
         end_dt = start_dt + datetime.timedelta(minutes=CONFIG.default_duration)
 
     if end_dt <= start_dt:
         end_dt = start_dt + datetime.timedelta(minutes=CONFIG.default_duration)
 
-    # Email extraction logic
+    # Hardened Email Extraction
     valid_attendees = []
     invalid_notes = []
     email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    for entry in data.get('attendees', []):
+    
+    raw_attendees = data.get('attendees', [])
+    if isinstance(raw_attendees, str): raw_attendees = [raw_attendees]
+    
+    for entry in raw_attendees:
         entry = entry.strip()
         if re.match(email_regex, entry):
             valid_attendees.append(entry)
         else:
             invalid_notes.append(entry)
 
-    description = data.get('description', '')
+    desc = data.get('description', '')
     if invalid_notes:
-        note = f"\nNote: Attendees without emails: {', '.join(invalid_notes)}"
-        description = (description + note).strip()
+        note = f"\n\nAttendees (to be manually added): {', '.join(invalid_notes)}"
+        desc = (desc + note).strip()
 
     return EventDetails(
         action=data.get('action', 'create'),
-        title=data.get('title', 'Untitled Event'),
+        title=data.get('title') or "New Event",
         start=start_dt.isoformat(),
         end=end_dt.isoformat(),
-        description=description,
+        description=desc,
         location=data.get('location', ''),
         attendees=valid_attendees,
-        add_meeting=data.get('add_meeting', False),
+        add_meeting=bool(data.get('add_meeting')),
         search_query=data.get('search_query', ''),
-        recurrence=data.get('recurrence', [])
+        recurrence=data.get('recurrence', []),
+        reminders_minutes=data.get('reminders_minutes', [15])
     )
 
 # ====================== API ACTIONS ======================
 
 def list_upcoming_events(service, start_time: str, end_time: str):
-    """Returns a list of event items."""
+    """Executes a list request with error handling."""
     try:
         events_result = service.events().list(
             calendarId='primary', timeMin=start_time, timeMax=end_time,
@@ -138,65 +177,41 @@ def list_upcoming_events(service, start_time: str, end_time: str):
         ).execute()
         return events_result.get('items', [])
     except Exception as e:
-        _console.print(f"[red]❌ List failed: {e}[/red]")
+        _console.print(f"[red]❌ Calendar List Error: {e}[/red]")
         return []
 
 def find_event(service, search_query: str):
-    """Searches for an event starting from the BEGINNING of the current day."""
+    """Searches for events with a widened 7-day window."""
     try:
-        now = datetime.datetime.now()
-        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone().isoformat()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         
         events_result = service.events().list(
             calendarId='primary', q=search_query, timeMin=start_of_day,
             maxResults=5, singleEvents=True, orderBy='startTime'
         ).execute()
         return events_result.get('items', [])
-    except: return []
+    except Exception as e:
+        _console.print(f"[red]❌ Search Error: {e}[/red]")
+        return []
 
 def delete_event(service, event_id: str):
     return service.events().delete(calendarId='primary', eventId=event_id).execute()
 
 def update_event(service, event_id: str, new_data: EventDetails):
+    """Updates an existing event while preserving un-changed fields."""
     event = service.events().get(calendarId='primary', eventId=event_id).execute()
-    event['summary'] = new_data.title
+    
+    if new_data.title: event['summary'] = new_data.title
     event['start'] = {'dateTime': new_data.start, 'timeZone': CONFIG.timezone}
     event['end'] = {'dateTime': new_data.end, 'timeZone': CONFIG.timezone}
+    if new_data.description: event['description'] = new_data.description
+    if new_data.location: event['location'] = new_data.location
+    
     return service.events().update(calendarId='primary', eventId=event_id, body=event).execute()
 
-def check_conflicts(service, start_time: str, end_time: str):
-    try:
-        body = {"timeMin": start_time, "timeMax": end_time, "items": [{"id": "primary"}]}
-        result = service.freebusy().query(body=body).execute()
-        return result['calendars']['primary']['busy']
-    except: return []
-
-def find_free_slots(service, start_search: str, duration_mins=None):
-    if duration_mins is None: duration_mins = CONFIG.default_duration
-    try:
-        search_dt = parser.parse(start_search)
-        max_search = search_dt + datetime.timedelta(days=7)
-        busy = service.freebusy().query(body={"timeMin": search_dt.isoformat(), "timeMax": max_search.isoformat(), "items": [{"id": "primary"}]}).execute()['calendars']['primary']['busy']
-        
-        free_slots = []
-        current_dt = search_dt
-        while len(free_slots) < 3 and current_dt < max_search:
-            if current_dt.hour < CONFIG.working_start: current_dt = current_dt.replace(hour=CONFIG.working_start, minute=0)
-            if current_dt.hour >= CONFIG.working_end: current_dt = (current_dt + datetime.timedelta(days=1)).replace(hour=CONFIG.working_start, minute=0)
-            
-            end_dt = current_dt + datetime.timedelta(minutes=duration_mins)
-            conflict = False
-            for b in busy:
-                b_start, b_end = parser.parse(b['start']), parser.parse(b['end'])
-                if (current_dt < b_end) and (end_dt > b_start):
-                    current_dt = b_end; conflict = True; break
-            if not conflict:
-                free_slots.append(current_dt)
-                current_dt = end_dt + datetime.timedelta(minutes=15)
-        return free_slots
-    except: return []
-
 def create_event(service, event: EventDetails):
+    """Creates a Google Calendar event with full feature support (Meet, Reminders, Recurrence)."""
     event_body = {
         'summary': event.title,
         'description': event.description,
@@ -204,21 +219,75 @@ def create_event(service, event: EventDetails):
         'start': {'dateTime': event.start, 'timeZone': CONFIG.timezone},
         'end':   {'dateTime': event.end,   'timeZone': CONFIG.timezone},
         'attendees': [{'email': e} for e in event.attendees],
+        'reminders': {
+            'useDefault': False,
+            'overrides': [{'method': 'popup', 'minutes': m} for m in event.reminders_minutes]
+        }
     }
     
     if event.add_meeting:
         event_body['conferenceData'] = {
             'createRequest': {'requestId': str(uuid.uuid4()), 'conferenceSolutionKey': {'type': 'hangoutsMeet'}}
         }
+    
     if event.recurrence:
         event_body['recurrence'] = event.recurrence
 
+    # Retry loop for resilience
     for attempt in range(3):
         try:
             return service.events().insert(
-                calendarId='primary', body=event_body, 
+                calendarId='primary', 
+                body=event_body, 
                 conferenceDataVersion=1 if event.add_meeting else 0
             ).execute()
         except Exception as e:
-            if attempt < 2 and any(k in str(e).lower() for k in ["eof", "protocol", "timeout"]): time.sleep(1); continue
+            if attempt < 2 and any(k in str(e).lower() for k in ["eof", "protocol", "timeout"]):
+                time.sleep(1.5)
+                continue
             raise e
+
+def check_conflicts(service, start_time: str, end_time: str):
+    """Checks for busy slots via FreeBusy API."""
+    try:
+        body = {"timeMin": start_time, "timeMax": end_time, "items": [{"id": "primary"}]}
+        result = service.freebusy().query(body=body).execute()
+        return result['calendars']['primary']['busy']
+    except: return []
+
+def find_free_slots(service, start_search: str, duration_mins=None):
+    """Calculates free slots within working hours."""
+    if duration_mins is None: duration_mins = CONFIG.default_duration
+    try:
+        search_dt = parser.parse(start_search)
+        max_search = search_dt + datetime.timedelta(days=7)
+        busy_data = service.freebusy().query(body={
+            "timeMin": search_dt.isoformat(), 
+            "timeMax": max_search.isoformat(), 
+            "items": [{"id": "primary"}]
+        }).execute()
+        busy = busy_data['calendars']['primary']['busy']
+        
+        free_slots = []
+        current_dt = search_dt
+        while len(free_slots) < 3 and current_dt < max_search:
+            # Respect working hours
+            if current_dt.hour < CONFIG.working_start: 
+                current_dt = current_dt.replace(hour=CONFIG.working_start, minute=0)
+            if current_dt.hour >= CONFIG.working_end: 
+                current_dt = (current_dt + datetime.timedelta(days=1)).replace(hour=CONFIG.working_start, minute=0)
+            
+            end_dt = current_dt + datetime.timedelta(minutes=duration_mins)
+            conflict = False
+            for b in busy:
+                b_start, b_end = parser.parse(b['start']), parser.parse(b['end'])
+                if (current_dt < b_end) and (end_dt > b_start):
+                    current_dt = b_end; conflict = True; break
+            
+            if not conflict:
+                free_slots.append(current_dt)
+                current_dt = end_dt + datetime.timedelta(minutes=15)
+        return free_slots
+    except Exception as e:
+        _console.print(f"[dim red]Free slot calc error: {e}[/dim red]")
+        return []
