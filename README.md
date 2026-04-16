@@ -1,81 +1,71 @@
 # 🐢 LazyScheduler
 
-**LazyScheduler** is a professional, secure, and minimal AI-powered calendar assistant. It transforms natural language into perfectly structured Google Calendar events, handling conflict checking, availability detection, and intent parsing with a premium terminal experience.
-
-Designed for the "Productive Procrastinator," LazyScheduler handles the thinking so you don't have to.
+LazyScheduler is a local-first terminal application that interfaces with the Google Calendar API using natural language parsing. It employs a dual-engine architecture to translate user intent into structured calendar operations while maintaining local privacy and security.
 
 ---
 
-## ✨ Key Features
+## 🏗️ Technical Architecture
 
-- **🧠 Advanced Intent Parsing**: Powered by Ollama (`qwen2.5:7b`), it understands complex requests like *"Move my 4 PM sync to 5 PM"* or *"Make that meeting an hour long instead."*
-- **🔓 Dynamic Availability Detection**: Scans your schedule to find all contiguous "gaps" (e.g., `09:00 → 13:45`) and calculates how much free time is in each window.
-- **🛡️ Built-in Security**: Includes an input sanitation layer to protect against prompt injection and strict Pydantic validation for AI outputs.
-- **💎 Premium CLI UI**: A beautiful terminal interface using the **Rich** library, featuring thinking spinners, vibrant color-coded cards, and professional schedule tables.
-- **📜 Professional Logging**: Every action, API call, and internal event is tracked in `scheduler.log` for easy auditing and debugging.
-- **🔁 Recurring & Video Support**: Full support for RFC5545 recurrence rules and automatic Google Meet link generation.
+LazyScheduler is designed with a decoupled, modular approach:
 
----
-
-## 🏗️ Architecture
-
-LazyScheduler follows a modular, hardened architecture:
-- **`core.py`**: The engine. Handles modular parsing, sanitization, and Google Calendar API orchestration.
-- **`main.py`**: The UI layer. Manages the CLI loop and user interaction.
-- **`config.py`**: Auto-generates configuration if missing and manages environment settings.
+- **Parsing Layer (`core.py`)**: 
+    - **🧠 Advanced Intent Parsing**: Powered by Ollama (`qwen2.5:7b`), it understands complex requests or contextual corrections (e.g., *"Make that meeting an hour long instead"*).
+- **🧙 Smart Reschedule (Magic Fix)**: If a critical meeting conflicts with a flexible task (like "Gym" or "Lunch"), the app will offer to **automatically move** the lower-priority event to the next available gap to clear your schedule.
+- **🔓 Dynamic Availability Detection**: Scans your schedule to find all contiguous "gaps" and calculates exactly how much free time is in each window.
+    - **Rule-Based Fallback**: A regex-based engine handles common commands (List, Today, Delete) independently of the AI service to ensure reliability when the LLM is offline.
+    - **Pydantic Validation**: All parsing outputs are strictly validated against a schema before execution.
+- **Scheduling Logic**: Priority-aware conflict resolution and gap detection using Google Free/Busy and event metadata.
+- **Security Layer**: 
+    - Truncates and filters input to mitigate prompt injection.
+    - Employs official OAuth2 flows for secure Google API authentication.
+- **UI Layer (`main.py`)**: Built with the `Rich` library for structured terminal output, including time-range formatting and conflict warnings.
 
 ---
 
-## 🚀 Getting Started
+## 🛠️ Stack
 
-### 1. Prerequisites
-- **Python 3.10+**
-- **Ollama**: [Download here](https://ollama.com/)
-- **Google Cloud Account**: Enable the Google Calendar API and download your `credentials.json`.
+- **Language**: Python 3.10+
+- **Parsing**: Ollama (LLM) + Python `re` (Regex)
+- **Data Integrity**: Pydantic
+- **CLI Framework**: Rich
+- **API**: Google Calendar v3
+- **Authentication**: Google OAuth2
+
+---
+
+## 🚀 Setup
+
+### 1. Requirements
+- **Ollama**: [ollama.com](https://ollama.com/)
+- **Model**: `ollama pull qwen2.5:7b`
+- **Google API**: Enable Calendar API in Google Cloud Console and save `credentials.json` to the root directory.
 
 ### 2. Installation
 ```bash
-# Clone the repo
-git clone https://github.com/aswaltedwin/lazy-scheduler.git
-cd lazy-scheduler
-
-# Install dependencies
+# Install required libraries
 pip install ollama google-api-python-client google-auth-oauthlib python-dateutil pydantic rich
 ```
 
-### 3. Model Setup
-```bash
-ollama pull qwen2.5:7b
-```
-
-### 4. Configuration
-On first run, the app will generate a `config.json`. You can customize:
-- `timezone`: Your local timezone (e.g., `Europe/London`).
-- `working_start` / `working_end`: Defines your daily search window for free time.
-- `model`: Change the LLM used for parsing (defaults to `qwen2.5:7b`).
+### 3. Configuration
+The application generates a `config.json` on the first run. Parameters:
+- `timezone`: Local timezone (IANA format).
+- `working_start` / `working_end`: Daily search boundaries (24h format).
+- `model`: Target Ollama model.
 
 ---
 
-## 🛠️ Usage
+## 💻 Supported Commands
 
-```bash
-python main.py
-```
-
-### Example Commands:
-- **Create**: *"Schedule a team sync with rahul@gmail.com tomorrow at 3 PM"*
-- **Availability**: *"When am I free tomorrow?"* or *"Find a 2 hour free slot this week"*
-- **Review**: *"List all my events this week"*
-- **Manage**: *"Delete the gym session on Friday"*
-- **Correct**: *"Actually, move that meeting to Monday morning"*
+- **Event Creation**: *"Sync session with team tomorrow at 2 PM"*
+- **Availability**: *"Show me all free slots tomorrow"* or *"Find a 1 hour gap today"*
+- **Management**: *"Delete the meeting with Manager"* or *"Cancel Friday gym"*
+- **Queries**: *"List my schedule for this week"* or *"What's happening today?"*
+- **Correction**: After a proposal, provide feedback like *"Actually, make it an hour long"* to update the context.
 
 ---
 
-## 🔒 Security & Privacy
-- **Local LLM**: Your natural language inputs are processed locally via Ollama.
-- **Sanitization**: Input is truncated and filtered for malicious patterns before reaching the AI.
-- **OAuth2**: Uses official Google OAuth2 flows for secure calendar access.
-- **Log Rotation**: Tracks system state in `scheduler.log` (make sure to keep this file local).
+## 📜 Logging & Debugging
+System events, AI responses, and API errors are logged to `scheduler.log`. This file is ignored by Git to protect session metadata.
 
 ---
 

@@ -19,7 +19,9 @@ from core import (
     find_event,
     delete_event,
     update_event,
+    get_magic_fix_proposal,
     logger
+
 )
 
 console = Console()
@@ -140,15 +142,28 @@ def main():
             else: # create action
                 busy = check_conflicts(service, event.start, event.end)
                 if busy:
-                    console.print("\n[bold red]⚠️ CONFLICT:[/bold red] You are already busy!")
-                    suggestions = find_free_slots(service, event.start)
-                    if suggestions:
-                        s_start, s_end = suggestions[0]
-                        console.print(f"👉 Next free block: [bold]{s_start.strftime('%a, %b %d at %H:%M')} [dim]→[/dim] {s_end.strftime('%H:%M')}[/bold]")
-                        if console.input("\nSwitch to this time? (y/n): ").strip().lower() in ['y', 'yes']:
-
-                            dur = parser.parse(event.end) - parser.parse(event.start)
-                            event.start, event.end = s_start.isoformat(), (s_start + dur).isoformat()
+                    console.print(f"\n[bold red]⚠️  CONFLICT:[/bold red] You have {len(busy)} event(s) during this time.")
+                    
+                    # Try Magic Fix
+                    magic_proposal = get_magic_fix_proposal(service, event, busy)
+                    if magic_proposal:
+                        console.print(f"🧙 [bold cyan]Magic Fix Available:[/bold cyan] I can move [italic]'{magic_proposal['target_summary']}'[/italic] to [bold]{magic_proposal['new_start'].strftime('%H:%M')}[/bold] to make room.")
+                        if console.input("   [white]Apply Magic Fix? (y/n): [/white]").strip().lower() in ['y', 'yes']:
+                            # Execute the move
+                            update_event(service, magic_proposal['target_id'], EventDetails(
+                                action="update",
+                                start=magic_proposal['new_start'].isoformat(),
+                                end=magic_proposal['new_end'].isoformat()
+                            ))
+                            console.print(f"[green]✨ Shifted '{magic_proposal['target_summary']}' successfully.[/green]")
+                    else:
+                        suggestions = find_free_slots(service, event.start)
+                        if suggestions:
+                            s_start, s_end = suggestions[0]
+                            console.print(f"👉 Next free block: [bold]{s_start.strftime('%a, %b %d at %H:%M')} [dim]→[/dim] {s_end.strftime('%H:%M')}[/bold]")
+                            if console.input("\nSwitch to this time? (y/n): ").strip().lower() in ['y', 'yes']:
+                                dur = parser.parse(event.end) - parser.parse(event.start)
+                                event.start, event.end = s_start.isoformat(), (s_start + dur).isoformat()
 
                 show_event_panel(event)
                 STATE.last_event = event
