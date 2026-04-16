@@ -2,7 +2,17 @@
 
 LazyScheduler is a local-first terminal application that interfaces with the Google Calendar API using natural language parsing. It employs a dual-engine architecture to translate user intent into structured calendar operations while maintaining local privacy and security.
 
+![Schedule View](docs/images/schedule_view.png)
+*Professional schedule visualization using the Rich library.*
+
+![Magic Fix Interaction](docs/images/magic_fix.png)
+*Intelligent conflict resolution with the 'Magic Fix' engine.*
+
+![Free Slots Detection](docs/images/free_slots.png)
+*High-fidelity contiguous free block detection.*
+
 ---
+
 
 ## 🏗️ Technical Architecture
 

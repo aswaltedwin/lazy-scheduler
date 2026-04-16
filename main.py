@@ -101,8 +101,13 @@ def main():
             
             if event.action == "list":
                 items = list_upcoming_events(service, event.start, event.end)
+                if event.search_query:
+                    # Filter items by search_query if present
+                    items = [it for it in items if event.search_query.lower() in it.get('summary', '').lower()]
+                
                 show_schedule_table(items)
                 STATE.last_event = None
+
                 
             elif event.action == "find_slot":
                 # Find all free blocks, using the duration explicitly requested (if any)
@@ -122,9 +127,26 @@ def main():
                 
             elif event.action in ["delete", "update"]:
                 matches = find_event(service, event.search_query)
+                
+                # If no specific match by name, check if it's a range delete (e.g., "all tomorrow")
+                if not matches and event.action == "delete" and event.start and event.end:
+                    matches = list_upcoming_events(service, event.start, event.end)
+
                 if not matches:
                     console.print(f"[yellow]No match found for '{event.search_query}'[/yellow]")
+                elif len(matches) > 1 and event.action == "delete":
+                    # Batch Delete Flow
+                    console.print(f"\n[bold red]🗑️  Batch Delete:[/bold red] Found {len(matches)} events in this range:")
+                    for m in matches:
+                        m_s = m['start'].get('dateTime', m['start'].get('date'))[:16].replace('T', ' ')
+                        console.print(f"   - [bold]{m['summary']}[/bold] at {m_s}")
+                    
+                    if console.input(f"\n[bold red]Delete ALL {len(matches)} events?[/bold red] (y/n): ").lower() in ['y', 'yes']:
+                        for m in matches:
+                            delete_event(service, m['id'])
+                        console.print(f"[green]💥 Cleared {len(matches)} events successfully.[/green]")
                 else:
+                    # Single Match Flow
                     target = matches[0]
                     target_start = target['start'].get('dateTime', target['start'].get('date'))
                     console.print(f"🎯 Found: [bold]{target['summary']}[/bold] at {target_start[:16]}")
@@ -138,6 +160,7 @@ def main():
                             update_event(service, target['id'], event)
                             console.print(f"[green]🔄 Updated successfully.[/green]")
                 STATE.last_event = None
+
                 
             else: # create action
                 busy = check_conflicts(service, event.start, event.end)

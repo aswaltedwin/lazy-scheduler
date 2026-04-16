@@ -82,27 +82,55 @@ class RuleBasedParser:
         local_tz = tz.gettz(CONFIG.timezone)
         now = datetime.datetime.now(local_tz)
 
-        # Regex for "list" commands
-        list_patterns = [r"show (my )?schedule", r"list (all )?events", r"what (do|is) i have"]
-        if any(re.search(p, text) for p in list_patterns):
-            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            end = start + datetime.timedelta(days=1)
-            
+        # Regex for "list" commands (Schedule/Status/Search)
+        list_patterns = [r"show (my )?schedule", r"list (all )?events", r"what (do|is) i have", r"list (all )?the events", r"when (is|do i|i) have (.+)"]
+        list_match = any(re.search(p, text) for p in list_patterns)
+        if list_match:
+            # Specific range logic
             if "tomorrow" in text:
-                start += datetime.timedelta(days=1)
-                end += datetime.timedelta(days=1)
+                start = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                end = start + datetime.timedelta(days=1, seconds=-1)
             elif "week" in text:
-                days_to_sat = 5 - now.weekday()
-                if days_to_sat < 0: days_to_sat += 7
-                end = (now + datetime.timedelta(days=days_to_sat)).replace(hour=23, minute=59, second=59)
-                
+                days_to_sun = (now.weekday() + 1) % 7
+                start = (now - datetime.timedelta(days=days_to_sun)).replace(hour=0, minute=0, second=0, microsecond=0)
+                end = (start + datetime.timedelta(days=7, seconds=-1))
+            else:
+                start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                if "today" in text or "what do i have" in text or "what's happening" in text:
+                    end = start + datetime.timedelta(days=1, seconds=-1)
+                else:
+                    end = start + datetime.timedelta(days=31, seconds=-1)
+
+            # Unified "When is [Query]" handling
+            when_match = re.search(r"when (is|do i|i) have (.+)", text)
+            if when_match:
+                query = when_match.group(2).strip()
+                # Aggressive cleaning (strip 'my', 'the', and possessive ''s')
+                query = re.sub(r"^(my|the|a|an)\s+", "", query)
+                query = re.sub(r"['’]s(\s+|$)", " ", query).strip()
+                # Look ahead for up to 31 days for specific events
+                return EventDetails(action="list", search_query=query, start=start.isoformat(), end=(start + datetime.timedelta(days=31)).isoformat())
+
             return EventDetails(action="list", start=start.isoformat(), end=end.isoformat())
 
-        # Regex for "delete" commands
-        delete_match = re.search(r"(?:delete|remove|cancel) (.+)", text)
-        if delete_match:
-            query = delete_match.group(1).strip()
-            return EventDetails(action="delete", search_query=query)
+
+
+        # Regex for "delete" commands (Strict: only simple phrases or 'last')
+        # We skip if words like 'all', 'everything', or multiple days are mentioned
+        complex_keywords = ["all", "everything", "every", "schedules", "clear"]
+        if any(w in text for w in complex_keywords):
+            pass # Fall through to AI
+        else:
+            delete_patterns = [r"delete (.+)", r"remove (.+)", r"cancel (.+)"]
+            for p in delete_patterns:
+                match = re.search(p, text)
+                if match:
+                    query = match.group(1).strip()
+                    # If query is too long (> 3 words), it's likely complex NLP
+                    if len(query.split()) > 3:
+                        continue
+                    return EventDetails(action="delete", search_query=query)
+
 
         # Regex for "free slots"
         free_patterns = [r"when am i free", r"any free (slots|time)", r"find free time"]
@@ -157,9 +185,14 @@ Upcoming Days: {calendar_str}
 JSON FORMAT: {{ "action": "create"|"list"|"delete"|"update"|"find_slot", "title": "string", "start": "ISO8601", "end": "ISO8601", "description": "string", "location": "string", "attendees": ["email"], "add_meeting": bool, "search_query": "string",  "duration_mins": int,
   "priority": int
 }}
+- "list": Use this for "Show my schedule", "What's happening", "When is my [event]", "When do I have [event]", "List events".
+- "find_slot": Use this ONLY if searching for GAPS/FREE TIME (e.g. "Find a 30m gap", "When am I free"). DO NOT use for "When is my [event]".
+
+
 - "priority": 1 (Low: Gym/Lunch/Coffee), 2 (Normal), 3 (High: Meeting/Sync/CEO/Urgent). Default: 2.
 - Only set "duration_mins" if the user specifies a length (e.g. "30m gap"). Otherwise keep it 0.
 Return ONLY JSON. """
+
 
     messages = [{"role": "system", "content": system_prompt}]
     if context:
@@ -214,15 +247,20 @@ def _validate_and_transform_response(raw_json, now_dt):
 
 
 def parse_natural_language(text: str, context: EventDetails = None) -> EventDetails:
-    """Orchestrates parsing using AI with RuleBased fallback."""
-    text = Sanitizer.sanitize_input(text)
+    """Orchestrates parsing by prioritizing Rule-Based patterns over the AI Engine."""
+    text_sanitized = Sanitizer.sanitize_input(text)
     
-    # 1. Try AI first (if enabled and reachable)
-    raw_response = None
+    # 1. Try Rule-Based Parser first (Catch high-confidence common commands)
+    rule_event = RuleBasedParser.parse(text_sanitized)
+    if rule_event:
+        logger.info(f"Rule-Based Match: {rule_event.action}")
+        return rule_event
+
+    # 2. Fallback to AI Engine for complex intent extraction
     try:
         now_dt, today_str, sat_str, calendar_str = _get_prompt_metadata()
-        messages = _build_prompt(text, context, today_str, now_dt, sat_str, calendar_str)
-        with _console.status(f"[bold yellow]Analyzing with {CONFIG.model}...", spinner="dots"):
+        messages = _build_prompt(text_sanitized, context, today_str, now_dt, sat_str, calendar_str)
+        with _console.status(f"[bold yellow]Analyzing intent...", spinner="dots"):
             raw_response = _execute_llm_call(messages)
             if raw_response:
                 event = _validate_and_transform_response(raw_response, now_dt)
@@ -230,24 +268,27 @@ def parse_natural_language(text: str, context: EventDetails = None) -> EventDeta
                     logger.info(f"AI Parsed: {event.action}")
                     return event
     except Exception as e:
-        logger.debug(f"AI Path skipped: {e}")
+        logger.debug(f"AI Path error: {e}")
 
-    # 2. Fallback to RuleBasedParser
-    logger.info("Using RuleBasedParser fallback.")
-    event = RuleBasedParser.parse(text)
-    if event: return event
-    
-    raise ValueError("Could not understand the command. AI was unreachable and no patterns matched.")
+    raise ValueError("Could not understand the command. No patterns matched and AI failed.")
+
 
 # ====================== CALENDAR OPERATIONS ======================
 
 def list_upcoming_events(service, start_time: str, end_time: str):
     try:
+        if not start_time or not end_time:
+            local_tz = tz.gettz(CONFIG.timezone)
+            now = datetime.datetime.now(local_tz)
+            start_time = start_time or now.replace(hour=0, minute=0, second=0).isoformat()
+            end_time = end_time or (parser.parse(start_time) + datetime.timedelta(days=30)).isoformat()
+            
         events_result = service.events().list(
             calendarId='primary', timeMin=start_time, timeMax=end_time,
             singleEvents=True, orderBy='startTime'
         ).execute()
         return events_result.get('items', [])
+
     except Exception as e:
         logger.error(f"Calendar List Error: {e}"); return []
 
@@ -348,32 +389,63 @@ def get_magic_fix_proposal(service, new_event: EventDetails, conflicts: list):
     return None
 
 def find_free_slots(service, start_search: str, min_duration_mins=None):
-
     try:
+        local_tz = tz.gettz(CONFIG.timezone)
         search_dt = parser.parse(start_search)
-        now = datetime.datetime.now(search_dt.tzinfo)
+        if search_dt.tzinfo is None: search_dt = search_dt.replace(tzinfo=local_tz)
+        
+        now = datetime.datetime.now(local_tz)
         if search_dt < now: search_dt = now
-        max_search = search_dt + datetime.timedelta(days=7)
+        
+        max_search = (search_dt + datetime.timedelta(days=7)).replace(hour=23, minute=59)
         busy_data = service.freebusy().query(body={"timeMin": search_dt.isoformat(), "timeMax": max_search.isoformat(), "items": [{"id": "primary"}]}).execute()
-        busy = sorted([ (parser.parse(b['start']), parser.parse(b['end'])) for b in busy_data['calendars']['primary']['busy'] ])
+        
+        # Ensure all busy intervals are in local timezone
+        busy = []
+        for b in busy_data['calendars']['primary']['busy']:
+            s_ext = parser.parse(b['start']).astimezone(local_tz)
+            e_ext = parser.parse(b['end']).astimezone(local_tz)
+            busy.append((s_ext, e_ext))
+        busy.sort()
+        
         free_blocks = []
-        for i in range(7):
+        for i in range(14): # Search up to 2 weeks
             day_target = (search_dt + datetime.timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
-            work_start = day_target.replace(hour=CONFIG.working_start)
-            work_end = day_target.replace(hour=CONFIG.working_end)
+            work_start = day_target.replace(hour=CONFIG.working_start).replace(tzinfo=local_tz)
+            work_end = day_target.replace(hour=CONFIG.working_end).replace(tzinfo=local_tz)
+            
             if work_end < now: continue
             if work_start < now: work_start = now
+            
+            # Check if there are ANY events for this specific day
+            day_busy = [b for b in busy if b[0].date() == day_target.date()]
+            
+            if not day_busy:
+                # No events at all? Show full 24h block
+                f_s = day_target.replace(hour=0, minute=0, second=0, tzinfo=local_tz)
+                f_e = day_target.replace(hour=23, minute=59, second=59, tzinfo=local_tz)
+                if f_e > now: # Only add if the day hasn't passed
+                    free_blocks.append((max(now, f_s), f_e))
+                continue
+
             current_ptr = work_start
-            for b_s, b_e in busy:
+            for b_s, b_e in day_busy:
                 if b_e <= work_start: continue
-                if b_s >= work_end: break
+                if b_s >= work_end: continue
+                
                 if b_s > current_ptr:
                     gap_dur = (b_s - current_ptr).total_seconds() / 60
-                    if not min_duration_mins or gap_dur >= min_duration_mins: free_blocks.append((current_ptr, b_s))
+                    if not min_duration_mins or gap_dur >= min_duration_mins:
+                        free_blocks.append((current_ptr, b_s))
                 current_ptr = max(current_ptr, b_e)
+
             if current_ptr < work_end:
                 gap_dur = (work_end - current_ptr).total_seconds() / 60
-                if not min_duration_mins or gap_dur >= min_duration_mins: free_blocks.append((current_ptr, work_end))
+                if not min_duration_mins or gap_dur >= min_duration_mins:
+                    free_blocks.append((current_ptr, work_end))
+
+                    
         return free_blocks[:10]
     except Exception as e:
         logger.error(f"Free Block Error: {e}"); return []
+
