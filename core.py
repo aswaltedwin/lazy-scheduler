@@ -6,7 +6,8 @@ import time
 import uuid
 import logging
 import ollama
-from pydantic import BaseModel, Field
+from models import EventDetails
+from logging.handlers import RotatingFileHandler
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -22,35 +23,13 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("scheduler.log"),
+        RotatingFileHandler("scheduler.log", maxBytes=5_000_000, backupCount=3),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger("LazyScheduler")
 
-# ====================== DATA MODELS ======================
-
-class EventDetails(BaseModel):
-    action: str = Field(..., description="Action to perform: create, list, delete, update, find_slot")
-    title: str = Field("", description="Summarized title of the event")
-    start: str = Field("", description="ISO format start time")
-    end: str = Field("", description="ISO format end time")
-    description: str = Field("", description="Detailed notes or description")
-    location: str = Field("", description="Physical or virtual location")
-    attendees: list[str] = Field(default_factory=list, description="List of email addresses")
-    add_meeting: bool = Field(False, description="Whether to add a Google Meet link")
-    search_query: str = Field("", description="Query string for finding events to delete or update")
-    recurrence: list[str] = Field(default_factory=list, description="RFC5545 RRULE string")
-    reminders_minutes: list[int] = Field(default_factory=lambda: [15], description="Minutes before event for popup reminders")
-    duration_mins: int = Field(0, description="Minimum duration in minutes for finding a free slot")
-    priority: int = Field(2, description="Priority: 1=Low, 2=Normal, 3=High")
-
-
-class SessionState:
-    last_event: EventDetails = None
-    last_raw_input: str = ""
-
-STATE = SessionState()
+from config import CONFIG, STATE
 _console = Console()
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
@@ -111,7 +90,8 @@ class RuleBasedParser:
                             target_dt = target_dt.replace(year=now.year + 1)
                         start = target_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=local_tz)
                         end = start + datetime.timedelta(days=1, seconds=-1)
-                    except:
+                    except Exception:
+                        logger.debug("Failed to parse month/day pattern, falling back to 31-day search")
                         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
                         end = start + datetime.timedelta(days=31, seconds=-1)
                 else:
@@ -229,15 +209,23 @@ Return ONLY JSON. """
 def _execute_llm_call(messages):
     try:
         response = ollama.chat(model=CONFIG.model, messages=messages, format='json')
-        return response['message']['content']
+        content = response['message']['content']
+        # Tolerance: Extract JSON if LLM added commentary around the JSON block
+        if "{" in content and "}" in content:
+            start_idx = content.find("{")
+            end_idx = content.rfind("}") + 1
+            return content[start_idx:end_idx]
+        return content
     except Exception as e:
-        logger.warning(f"Ollama call failed (fallback engine will be used if possible): {e}")
+        logger.warning(f"Ollama call failed: {e}")
         return None
 
 def _validate_and_transform_response(raw_json, now_dt):
     try:
         data = json.loads(raw_json)
-    except: return None
+    except json.JSONDecodeError:
+        logger.error(f"Failed to parse LLM JSON response: {raw_json}")
+        return None
     local_tz = tz.gettz(CONFIG.timezone)
     def finalize_dt(dt_str):
         if not dt_str: return None
@@ -245,7 +233,9 @@ def _validate_and_transform_response(raw_json, now_dt):
             parsed = parser.parse(dt_str)
             if parsed.tzinfo is None: parsed = parsed.replace(tzinfo=local_tz)
             return parsed
-        except: return None
+        except (ValueError, TypeError, parser.ParserError):
+            logger.debug(f"Could not parse dateTime string: {dt_str}")
+            return None
     start_dt = finalize_dt(data.get('start'))
     if not start_dt:
         start_dt = now_dt.replace(hour=0, minute=0, second=0) if data.get('action') == 'list' else now_dt
@@ -384,7 +374,8 @@ def create_event(service, event: EventDetails):
     for attempt in range(3):
         try:
             return service.events().insert(calendarId='primary', body=event_body, conferenceDataVersion=1 if event.add_meeting else 0).execute()
-        except:
+        except Exception:
+            logger.warning(f"Create event attempt {attempt+1} failed", exc_info=True)
             if attempt < 2: time.sleep(1.5); continue
             raise
 
@@ -469,7 +460,7 @@ def get_magic_fix_proposal(service, new_event: EventDetails, conflicts: list):
                 if check_conflicts(service, slot_start.isoformat(), slot_end.isoformat()): continue
                     
                 cost = _calculate_move_cost(target, t_s, slot_start)
-                if (slot_start - t_s).total_seconds() / 3600 > 6: continue
+                if (slot_start - t_s).total_seconds() / 3600 > CONFIG.max_shift_hours: continue
                     
                 proposals.append({
                     "targets": [{
@@ -498,7 +489,7 @@ def get_magic_fix_proposal(service, new_event: EventDetails, conflicts: list):
                 new_t_s = current_ptr
                 new_t_e = current_ptr + t_dur
                 
-                if (new_t_s - t_s).total_seconds() / 3600 > 6:
+                if (new_t_s - t_s).total_seconds() / 3600 > CONFIG.max_shift_hours:
                     valid_multi = False; break
                 
                 if check_conflicts(service, new_t_s.isoformat(), new_t_e.isoformat()):
@@ -533,7 +524,8 @@ def find_free_slots(service, start_search: str, min_duration_mins=None):
         now = datetime.datetime.now(local_tz)
         if search_dt < now: search_dt = now
         
-        max_search = (search_dt + datetime.timedelta(days=7)).replace(hour=23, minute=59)
+        # Query 2 weeks of busy data since the loop below checks up to 14 days
+        max_search = (search_dt + datetime.timedelta(days=14)).replace(hour=23, minute=59)
         busy_data = service.freebusy().query(body={"timeMin": search_dt.isoformat(), "timeMax": max_search.isoformat(), "items": [{"id": "primary"}]}).execute()
         
         # Ensure all busy intervals are in local timezone
@@ -551,20 +543,24 @@ def find_free_slots(service, start_search: str, min_duration_mins=None):
             work_end = day_target.replace(hour=CONFIG.working_end).replace(tzinfo=local_tz)
             
             if work_end < now: continue
-            if work_start < now: work_start = now
+            
+            # For the first day of search, we must start from search_dt if it's later than work_start
+            effective_start = work_start
+            if i == 0 and search_dt > work_start:
+                effective_start = search_dt
+            
+            if effective_start < now: effective_start = now
             
             # Check if there are ANY events for this specific day
             day_busy = [b for b in busy if b[0].date() == day_target.date()]
             
             if not day_busy:
-                # No events at all? Show full 24h block
-                f_s = day_target.replace(hour=0, minute=0, second=0, tzinfo=local_tz)
-                f_e = day_target.replace(hour=23, minute=59, second=59, tzinfo=local_tz)
-                if f_e > now: # Only add if the day hasn't passed
-                    free_blocks.append((max(now, f_s), f_e))
+                # No events at all? Show whole working day remaining
+                if work_end > effective_start:
+                    free_blocks.append((effective_start, work_end))
                 continue
 
-            current_ptr = work_start
+            current_ptr = effective_start
             for b_s, b_e in day_busy:
                 if b_e <= work_start: continue
                 if b_s >= work_end: continue
@@ -582,6 +578,7 @@ def find_free_slots(service, start_search: str, min_duration_mins=None):
 
                     
         return free_blocks[:10]
-    except Exception as e:
-        logger.error(f"Free Block Error: {e}"); return []
+    except Exception:
+        logger.exception("Unexpected error in find_free_slots")
+        return []
 

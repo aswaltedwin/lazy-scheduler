@@ -6,10 +6,9 @@ from rich.panel import Panel
 from rich.table import Table
 
 # Import local modules
-from config import CONFIG
+from config import CONFIG, STATE
+from models import EventDetails
 from core import (
-    STATE,
-    EventDetails,
     get_calendar_service, 
     parse_natural_language, 
     check_conflicts, 
@@ -20,8 +19,8 @@ from core import (
     delete_event,
     update_event,
     get_magic_fix_proposal,
-    logger
-
+    logger,
+    _calculate_move_cost
 )
 
 console = Console()
