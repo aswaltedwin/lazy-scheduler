@@ -41,7 +41,8 @@ def show_event_panel(event: EventDetails, title="Proposed Event"):
         rem_str = ", ".join([f"{m}m" for m in event.reminders_minutes])
         content += f"[bold white]🔔 Alarms   :[/bold white] {rem_str} before\n"
     if event.recurrence:  content += f"[bold white]🔄 Repeat   :[/bold white] {event.recurrence[0]}\n"
-    if event.add_meeting: content += f"[bold white]📹 Video    :[/bold white] Google Meet Link will be generated\n"
+    if event.add_meeting: 
+        content += f"[bold white]📹 Video    :[/bold white] Google Meet Link will be generated\n"
     
     console.print(Panel(content, title=f"[bold cyan]{title}[/bold cyan]", border_style="cyan", expand=False))
 
@@ -85,7 +86,7 @@ def main():
 
     while True:
         try:
-            prefix = "[bold yellow]🔨 (Correction Mode)[/bold yellow] " if STATE.last_event else ""
+            prefix = "[bold yellow]🔨 (Edit Mode)[/bold yellow] " if STATE.last_event else ""
             user_input = console.input(f"\n{prefix}[bold green]You:[/bold green] ").strip()
             
             if user_input.lower() in ['quit', 'exit', 'q']:
@@ -100,12 +101,15 @@ def main():
                 continue
             
             if event.action == "list":
-                items = list_upcoming_events(service, event.start, event.end)
-                if event.search_query:
-                    # Filter items by search_query if present
-                    items = [it for it in items if event.search_query.lower() in it.get('summary', '').lower()]
-                
-                show_schedule_table(items)
+                try:
+                    items = list_upcoming_events(service, event.start, event.end)
+                    if event.search_query:
+                        # Filter items by search_query if present
+                        items = [it for it in items if event.search_query.lower() in it.get('summary', '').lower()]
+                    
+                    show_schedule_table(items)
+                except Exception as e:
+                    console.print(f"[bold red]Fetch Error:[/bold red] Could not retrieve schedule. ({e})")
                 STATE.last_event = None
 
                 
@@ -126,6 +130,31 @@ def main():
 
                 
             elif event.action in ["delete", "update"]:
+                # Optimization: If correcting a proposal, handle "update" action as refinement
+                if STATE.last_event and STATE.last_event.action == "create" and event.action == "update":
+                    if not event.search_query or event.search_query.lower() in STATE.last_event.title.lower():
+                        event.action = "create"
+                        show_event_panel(event)
+                        STATE.last_event = event
+                        choice = console.input("\n[bold white]Proceed?[/bold white] ([green]y[/green]- yes, [red]n[/red]- no, [yellow]e[/yellow]- edit): ").strip().lower()
+                        if choice in ['y', 'yes', '']:
+                            res = create_event(service, event)
+                            if res:
+                                msg = "[green]✅ Event Created![/green]\n"
+                                meet_link = next((ep.get('uri') for ep in res.get('conferenceData', {}).get('entryPoints', []) if ep.get('entryPointType') == 'video'), None)
+                                if meet_link: msg += f"📹 [bold cyan]Google Meet:[/bold cyan] [u]{meet_link}[/u]\n"
+                                if res.get('htmlLink'): msg += f"📅 [dim]Calendar Link: {res.get('htmlLink')}[/dim]"
+                                console.print(Panel(msg, border_style="green", expand=False))
+                            else:
+                                console.print("[red]❌ Failed to create event.[/red]")
+                            STATE.last_event = None
+                        elif choice in ['n', 'no']:
+                            console.print("[yellow]Cancelled.[/yellow]")
+                            STATE.last_event = None
+                        elif choice in ['e', 'edit']:
+                            console.print("[dim italic]Processing edit...[/dim italic]")
+                        continue
+
                 matches = find_event(service, event.search_query)
                 
                 # If no specific match by name, check if it's a range delete (e.g., "all tomorrow")
@@ -153,19 +182,26 @@ def main():
                     
                     prompt = "Update this event? (y/n): " if event.action == "update" else "Delete this event? (y/n): "
                     if console.input(prompt).lower() in ['y', 'yes']:
-                        if event.action == "delete": 
-                            delete_event(service, target['id'])
-                            console.print(f"[green]🗑️ Deleted successfully.[/green]")
-                        else:
-                            update_event(service, target['id'], event)
-                            console.print(f"[green]🔄 Updated successfully.[/green]")
+                        try:
+                            if event.action == "delete": 
+                                delete_event(service, target['id'])
+                                console.print(f"[green]🗑️ Deleted successfully: [bold]{target['summary']}[/bold][/green]")
+                            else:
+                                update_event(service, target['id'], event)
+                                console.print(f"[green]🔄 Updated successfully: [bold]{event.title or target['summary']}[/bold][/green]")
+                        except Exception as e:
+                            console.print(f"[bold red]Operation Failed:[/bold red] {e}")
                 STATE.last_event = None
 
                 
             else: # create action
-                busy = check_conflicts(service, event.start, event.end)
-                if busy:
-                    console.print(f"\n[bold red]⚠️  CONFLICT:[/bold red] You have {len(busy)} event(s) during this time.")
+                try:
+                    busy = check_conflicts(service, event.start, event.end)
+                    if busy:
+                        console.print(f"\n[bold red]⚠️  CONFLICT:[/bold red] You have {len(busy)} event(s) during this time.")
+                except Exception as e:
+                    console.print(f"[bold yellow]⚠️  Warning:[/bold yellow] Could not check for conflicts. ({e})")
+                    busy = []
                     
                     # Try Magic Fix
                     magic_proposal = get_magic_fix_proposal(service, event, busy)
@@ -225,8 +261,18 @@ def main():
                 show_event_panel(event)
                 STATE.last_event = event
 
-                choice = console.input("\n[bold white]Proceed?[/bold white] ([green]y[/green]/[red]n[/red]/correct): ").strip().lower()
-                if choice in ['y', 'yes']:
+                # Smart Intent: Don't ask for location if it's a task/reminder or 0-duration
+                non_physical_keywords = ["deadline", "reminder", "due", "task", "check", "pay", "buy", "bill", "ship"]
+                is_task = any(k in event.title.lower() for k in non_physical_keywords) or (event.start == event.end)
+
+                if not event.location.strip() and not event.add_meeting and event.action == "create" and not is_task:
+                    prompt = "\n📍 [cyan]Where is this happening?[/cyan] (a- add location, y- skip, n- cancel, e- edit): "
+                else:
+                    prompt = "\n[bold white]Proceed?[/bold white] ([green]y[/green]- yes, [red]n[/red]- no, [yellow]e[/yellow]- edit): "
+
+                choice = console.input(prompt).strip().lower()
+                
+                if choice in ['y', 'yes', '', 'y- yes']:
                     res = create_event(service, event)
                     if res:
                         msg = "[green]✅ Event Created![/green]\n"
@@ -237,11 +283,26 @@ def main():
                     else:
                         console.print("[red]❌ Failed to create event.[/red]")
                     STATE.last_event = None
-                elif choice in ['n', 'no']:
+                elif choice in ['n', 'no', 'n- no']:
                     console.print("[yellow]Cancelled.[/yellow]")
                     STATE.last_event = None
+                elif choice in ['e', 'edit', 'e- edit']:
+                    console.print("[dim italic]Processing edit...[/dim italic]")
+                    continue
+                elif choice in ['a', 'a- add location']:
+                    loc = console.input("   📍 [cyan]Location:[/cyan] ").strip()
+                    if loc:
+                        event.location = loc
+                        console.print(f"[dim]Location set to: {loc}[/dim]")
+                    continue
                 else:
-                    console.print("[dim italic]Processing correction...[/dim italic]")
+                    # If location was missing and user typed text directly, treat it as location
+                    if not event.location.strip() and not event.add_meeting:
+                        event.location = choice
+                        console.print(f"[dim]Setting location to: {choice}[/dim]")
+                        continue
+                    
+                    console.print("[dim italic]Processing edit...[/dim italic]")
                     continue
 
         except KeyboardInterrupt:

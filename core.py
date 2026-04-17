@@ -95,24 +95,41 @@ class RuleBasedParser:
                 start = (now - datetime.timedelta(days=days_to_sun)).replace(hour=0, minute=0, second=0, microsecond=0)
                 end = (start + datetime.timedelta(days=7, seconds=-1))
             else:
-                start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                if "today" in text or "what do i have" in text or "what's happening" in text:
-                    end = start + datetime.timedelta(days=1, seconds=-1)
+                # Check for Month/Day patterns (e.g., "July 20", "20th Oct")
+                month_match = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?\b", text)
+                if not month_match:
+                    month_match = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", text)
+                
+                if month_match:
+                    try:
+                        g1, g2 = month_match.groups()
+                        if g1.isdigit(): day, mon = int(g1), g2
+                        else: mon, day = g1, int(g2)
+                        
+                        target_dt = parser.parse(f"{mon} {day}")
+                        if target_dt.replace(tzinfo=local_tz) < now.replace(hour=0, minute=0, second=0, microsecond=0):
+                            target_dt = target_dt.replace(year=now.year + 1)
+                        start = target_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=local_tz)
+                        end = start + datetime.timedelta(days=1, seconds=-1)
+                    except:
+                        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                        end = start + datetime.timedelta(days=31, seconds=-1)
                 else:
-                    end = start + datetime.timedelta(days=31, seconds=-1)
+                    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                    if "today" in text or "what do i have" in text or "what's happening" in text:
+                        end = start + datetime.timedelta(days=1, seconds=-1)
+                    else:
+                        end = start + datetime.timedelta(days=31, seconds=-1)
 
             # Unified "When is [Query]" handling
             when_match = re.search(r"when (is|do i|i) have (.+)", text)
             if when_match:
                 query = when_match.group(2).strip()
-                # Aggressive cleaning (strip 'my', 'the', and possessive ''s')
                 query = re.sub(r"^(my|the|a|an)\s+", "", query)
                 query = re.sub(r"['’]s(\s+|$)", " ", query).strip()
-                # Look ahead for up to 31 days for specific events
                 return EventDetails(action="list", search_query=query, start=start.isoformat(), end=(start + datetime.timedelta(days=31)).isoformat())
 
             return EventDetails(action="list", start=start.isoformat(), end=end.isoformat())
-
 
 
         # Regex for "delete" commands (Strict: only simple phrases or 'last')
@@ -135,14 +152,14 @@ class RuleBasedParser:
         # Regex for "free slots"
         free_patterns = [r"when am i free", r"any free (slots|time)", r"find free time"]
         if any(re.search(p, text) for p in free_patterns):
-            start = now.replace(hour=CONFIG.working_start, minute=0, second=0)
-            if "tomorrow" in text: start += datetime.timedelta(days=1)
+            start_fs = now.replace(hour=CONFIG.working_start, minute=0, second=0)
+            if "tomorrow" in text: start_fs += datetime.timedelta(days=1)
             # Default to 30m if not specified
             dur = 0
             dur_match = re.search(r"(\d+)\s*(?:min|minute)", text)
             if dur_match: dur = int(dur_match.group(1))
             
-            return EventDetails(action="find_slot", start=start.isoformat(), duration_mins=dur)
+            return EventDetails(action="find_slot", start=start_fs.isoformat(), duration_mins=dur)
 
         return None
 
@@ -185,12 +202,19 @@ Upcoming Days: {calendar_str}
 JSON FORMAT: {{ "action": "create"|"list"|"delete"|"update"|"find_slot", "title": "string", "start": "ISO8601", "end": "ISO8601", "description": "string", "location": "string", "attendees": ["email"], "add_meeting": bool, "search_query": "string",  "duration_mins": int,
   "priority": int
 }}
+- "create": Use for NEW events. If provided with "Context" (a proposed event), KEEP "action": "create" to refine its details unless the user explicitly wants to switch tasks.
+- "update": Use ONLY to modify events ALREADY ON THE CALENDAR. Requires a "search_query" to find the target.
 - "list": Use this for "Show my schedule", "What's happening", "When is my [event]", "When do I have [event]", "List events".
 - "find_slot": Use this ONLY if searching for GAPS/FREE TIME (e.g. "Find a 30m gap", "When am I free"). DO NOT use for "When is my [event]".
 
 
 - "priority": 1 (Low: Gym/Lunch/Coffee), 2 (Normal), 3 (High: Meeting/Sync/CEO/Urgent). Default: 2.
 - Only set "duration_mins" if the user specifies a length (e.g. "30m gap"). Otherwise keep it 0.
+
+- "HONOR NEGATIVE CONSTRAINTS": If the user says "no notes", "no description", "remove [field]", or "[field] is not needed", you MUST set that field to "" (empty string), [] (empty list), or False. NEVER hallucinate helpful notes if the user has suppressed them or hasn't provided details.
+
+- "VIRTUAL vs PHYSICAL": ONLY set "add_meeting": true if the user explicitly mentions words like "online", "virtual", "zoom", "meet", "video", or if the context is clearly a remote sync. For social, family, or physical activities (Lunch, Gym, Dinner, with parents, etc.), set it to false and leave "location" empty if not explicitly provided. Do NOT automatically add video links to physical events.
+
 Return ONLY JSON. """
 
 
@@ -226,8 +250,19 @@ def _validate_and_transform_response(raw_json, now_dt):
     if not start_dt:
         start_dt = now_dt.replace(hour=0, minute=0, second=0) if data.get('action') == 'list' else now_dt
         start_dt = start_dt.replace(tzinfo=local_tz)
-    end_dt = finalize_dt(data.get('end')) or (start_dt + datetime.timedelta(minutes=CONFIG.default_duration))
-    if end_dt <= start_dt: end_dt = start_dt + datetime.timedelta(minutes=CONFIG.default_duration)
+
+    # Smart duration: Tasks/Reminders can be 0-duration. Meetings default to 45m.
+    is_task = any(k in (data.get('title') or "").lower() for k in ["deadline", "reminder", "due", "task", "check", "pay", "buy", "bill"])
+    
+    end_dt = finalize_dt(data.get('end'))
+    if not end_dt:
+        if is_task:
+            end_dt = start_dt
+        else:
+            end_dt = start_dt + datetime.timedelta(minutes=CONFIG.default_duration)
+    
+    if not is_task and end_dt <= start_dt:
+        end_dt = start_dt + datetime.timedelta(minutes=CONFIG.default_duration)
     valid_attendees = [e.strip() for e in data.get('attendees', []) if re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', e.strip())]
     return EventDetails(
         action=data.get('action', 'create'),
@@ -290,7 +325,8 @@ def list_upcoming_events(service, start_time: str, end_time: str):
         return events_result.get('items', [])
 
     except Exception as e:
-        logger.error(f"Calendar List Error: {e}"); return []
+        logger.error(f"Calendar List Error: {e}")
+        raise # Propagate error instead of silent failure
 
 def find_event(service, search_query: str):
     try:
@@ -302,7 +338,8 @@ def find_event(service, search_query: str):
         ).execute()
         return events_result.get('items', [])
     except Exception as e:
-        logger.error(f"Event Search Error: {e}"); return []
+        logger.error(f"Event Search Error: {e}")
+        raise
 
 def delete_event(service, event_id: str):
     logger.info(f"Deleting event: {event_id}")
@@ -311,12 +348,23 @@ def delete_event(service, event_id: str):
 def update_event(service, event_id: str, new_data: EventDetails):
     logger.info(f"Updating event: {event_id}")
     event = service.events().get(calendarId='primary', eventId=event_id).execute()
+    
     if new_data.title: event['summary'] = new_data.title
     event['start'] = {'dateTime': new_data.start, 'timeZone': CONFIG.timezone}
     event['end'] = {'dateTime': new_data.end, 'timeZone': CONFIG.timezone}
-    if new_data.description: event['description'] = new_data.description
-    if new_data.location: event['location'] = new_data.location
-    return service.events().update(calendarId='primary', eventId=event_id, body=event).execute()
+    
+    # Strictly honor negative constraints or updates
+    event['description'] = new_data.description
+    event['location'] = new_data.location
+    
+    if new_data.attendees:
+        event['attendees'] = [{'email': e} for e in new_data.attendees]
+    
+    # Handle Video Link (Google Meet)
+    if new_data.add_meeting and 'conferenceData' not in event:
+        event['conferenceData'] = {'createRequest': {'requestId': str(uuid.uuid4()), 'conferenceSolutionKey': {'type': 'hangoutsMeet'}}}
+    
+    return service.events().update(calendarId='primary', eventId=event_id, body=event, conferenceDataVersion=1 if new_data.add_meeting else 0).execute()
 
 def create_event(service, event: EventDetails):
     logger.info(f"Creating event: {event.title}")
@@ -343,13 +391,20 @@ def create_event(service, event: EventDetails):
 def check_conflicts(service, start_time: str, end_time: str):
     """Returns a list of actual event items that overlap with the given range."""
     try:
+        local_tz = tz.gettz(CONFIG.timezone)
+        s_dt = parser.parse(start_time)
+        if s_dt.tzinfo is None: s_dt = s_dt.replace(tzinfo=local_tz)
+        e_dt = parser.parse(end_time)
+        if e_dt.tzinfo is None: e_dt = e_dt.replace(tzinfo=local_tz)
+
         events_result = service.events().list(
-            calendarId='primary', timeMin=start_time, timeMax=end_time,
+            calendarId='primary', timeMin=s_dt.isoformat(), timeMax=e_dt.isoformat(),
             singleEvents=True, orderBy='startTime'
         ).execute()
         return [e for e in events_result.get('items', []) if e.get('transparency') != 'transparent']
     except Exception as e:
-        logger.error(f"Conflict Check Error: {e}"); return []
+        logger.error(f"Conflict Check Error: {e}")
+        raise
 
 
 def _eval_priority(summary: str) -> int:
