@@ -6,6 +6,7 @@ import time
 import uuid
 import logging
 import ollama
+from ortools.sat.python import cp_model
 from models import EventDetails
 from logging.handlers import RotatingFileHandler
 from google.auth.transport.requests import Request
@@ -15,8 +16,7 @@ from googleapiclient.discovery import build
 from dateutil import parser, tz
 from rich.console import Console
 
-# Import local configuration
-from config import CONFIG
+# Import local configuration (imports moved to line 32 to avoid duplicates)
 
 # ====================== LOGGING SETUP ======================
 logging.basicConfig(
@@ -29,11 +29,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("LazyScheduler")
 
-from config import CONFIG, STATE
+from config import CONFIG, STATE, save_config
 _console = Console()
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
 # ====================== SECURITY & SANITATION ======================
+
+class ParsingError(ValueError):
+    """Raised when parsing fails, carries a smart suggestion for the user."""
+    def __init__(self, message, suggestion=None):
+        super().__init__(message)
+        self.suggestion = suggestion
+
 
 class Sanitizer:
     @staticmethod
@@ -295,7 +302,35 @@ def parse_natural_language(text: str, context: EventDetails = None) -> EventDeta
     except Exception as e:
         logger.debug(f"AI Path error: {e}")
 
-    raise ValueError("Could not understand the command. No patterns matched and AI failed.")
+    # If everything fails, try to generate a helpful suggestion
+    suggestion = get_smart_suggestion(text_sanitized)
+    raise ParsingError("Could not understand the command.", suggestion=suggestion)
+
+
+def get_smart_suggestion(text: str) -> str:
+    """Uses a lightweight AI call to guess what the user meant when parsing fails."""
+    prompt = f"""
+    The user entered an invalid command: "{text}"
+    
+    Strictly suggest a valid correction based on these formats:
+    1. schedule [title] [time]
+    2. find free slots [duration_mins]
+    3. list upcoming events
+    4. delete [title]
+    
+    If it's close to one, return JUST the corrected command text.
+    If it's total nonsense, return "Show me help".
+    
+    Correction:
+    """
+    try:
+        # Use a faster/smaller model or same model with short output
+        response = ollama.chat(model=CONFIG.model, messages=[{"role": "user", "content": prompt}])
+        suggestion = response['message']['content'].strip().strip('"').strip("'")
+        return suggestion if len(suggestion) < 100 else "Show me help"
+    except Exception as e:
+        logger.error(f"Suggestion engine error: {e}")
+        return "Show me help"
 
 
 # ====================== CALENDAR OPERATIONS ======================
@@ -405,113 +440,258 @@ def _eval_priority(summary: str) -> int:
     if any(k in summary for k in ["gym", "lunch", "coffee", "break", "personal", "workout"]): return 1
     return 2
 
+        
 def _calculate_move_cost(event, original_start, new_start):
     """Calculates the 'pain' cost of moving an event with Elite weights and Time Bias."""
     priority = _eval_priority(event.get('summary', ''))
-    duration_mins = (parser.parse(event['end'].get('dateTime', event['end'].get('date'))) - 
-                     parser.parse(event['start'].get('dateTime', event['start'].get('date')))).total_seconds() / 60
     
+    # Handle both dict-like and object-like event targets
+    if hasattr(event, 'start'):
+        # It's an EventDetails or similar object
+        e_s = parser.parse(event.start)
+        e_e = parser.parse(event.end)
+    elif 'start' in event and isinstance(event['start'], dict):
+        # It's a Google API dict
+        e_s = parser.parse(event['start'].get('dateTime', event['start'].get('date')))
+        e_e = parser.parse(event['end'].get('dateTime', event['end'].get('date')))
+    elif 'old_start' in event or 'new_start' in event:
+        # It's an internal proposal target dict
+        e_s = event.get('new_start') or event.get('old_start')
+        e_e = event.get('new_end') or e_s
+    else:
+        # Fallback if no timing info found
+        e_s = original_start
+        e_e = original_start
+
+    duration_mins = (e_e - e_s).total_seconds() / 60
     shift_hours = abs((new_start - original_start).total_seconds()) / 3600
     w = CONFIG.cost_weights
     
-    # Base Cost: Weight * Value
-    cost = (priority * w.get('priority', 25.0)) + \
-           (shift_hours * w.get('distance', 8.0)) + \
-           (duration_mins * w.get('duration', 0.5))
+    # Base Cost Components
+    p_cost = (priority * w.priority)
+    d_cost = (shift_hours * w.distance)
+    dur_cost = (duration_mins * w.duration)
     
     # Apply Time Bias (Behavioral Preference)
     pref = CONFIG.preferences
-    bias = pref.get('time_bias', 'morning')
-    strength = pref.get('bias_strength', 10.0)
-    
-    if bias == 'morning' and new_start.hour >= 12:
-        cost += strength
-    elif bias == 'evening' and new_start.hour < 12:
-        cost += strength
+    bias_cost = 0
+    if pref.time_bias == 'morning' and new_start.hour >= 12:
+        bias_cost = pref.bias_strength
+    elif pref.time_bias == 'evening' and new_start.hour < 12:
+        bias_cost = pref.bias_strength
         
-    return cost
+    total = p_cost + d_cost + dur_cost + bias_cost
+    
+    breakdown = {
+        "priority": p_cost,
+        "distance": d_cost,
+        "duration": dur_cost,
+        "bias": bias_cost,
+        "priority_val": priority,
+        "distance_val": shift_hours,
+        "duration_val": duration_mins
+    }
+    return total, breakdown
 
+
+class OptimizationEngine:
+    """Formal constraint optimization engine powered by Google OR-Tools."""
+    
+    @staticmethod
+    def solve_scheduling_problem(service, new_event: EventDetails, conflicts: list, all_day_events: list):
+        """Finds the globally optimal arrangement using CP-SAT solver."""
+        model = cp_model.CpModel()
+        local_tz = tz.gettz(CONFIG.timezone)
+        
+        # 1. Horizon & Granularity
+        # We model the day in minutes from 00:00
+        ref_date = parser.parse(new_event.start).replace(hour=0, minute=0, second=0, microsecond=0)
+        if ref_date.tzinfo is None: ref_date = ref_date.replace(tzinfo=local_tz)
+
+        def to_min(dt_str):
+            dt = parser.parse(dt_str)
+            if dt.tzinfo is None: dt = dt.replace(tzinfo=local_tz)
+            # Normalize to the same timezone as ref_date for subtraction
+            return int((dt.astimezone(ref_date.tzinfo) - ref_date).total_seconds() / 60)
+
+        work_start_min = CONFIG.working_start * 60
+        work_end_min = CONFIG.working_end * 60
+        max_shift_min = int(CONFIG.max_shift_hours * 60)
+
+        # 2. Collect all candidates for movement (All events in the day except urgent ones?)
+        # For efficiency, we only move events that are involved in the conflict loop
+        movable_events = []
+        for e in all_day_events:
+            p = _eval_priority(e.get('summary', ''))
+            if p < 3 or e.get('id') in [c.get('id') for c in conflicts]:
+                 movable_events.append(e)
+
+        # 3. Define Variables
+        vars = {}
+        intervals = []
+        
+        # New Event (Target)
+        new_start_min = to_min(new_event.start)
+        new_end_min = to_min(new_event.end)
+        new_dur = new_end_min - new_start_min
+        
+        # The new event is FIXED in its proposed slot for this optimization attempt
+        new_interval = model.NewIntervalVar(new_start_min, new_dur, new_end_min, "new_event_interval")
+        intervals.append(new_interval)
+
+        # Other events
+        for e in all_day_events:
+            e_id = e.get('id')
+            e_summary = e.get('summary', 'Unknown')
+            e_start = to_min(e['start'].get('dateTime', e['start'].get('date')))
+            e_end = to_min(e['end'].get('dateTime', e['end'].get('date')))
+            e_dur = e_end - e_start
+            
+            p = _eval_priority(e_summary)
+            
+            if e in movable_events:
+                # Movable Variable
+                # Constraints: must stay within working hours and within max_shift
+                lb = max(work_start_min, e_start - max_shift_min)
+                ub = min(work_end_min, e_end + max_shift_min) - e_dur
+                
+                s_var = model.NewIntVar(lb, ub, f"start_{e_id}")
+                end_var = model.NewIntVar(lb + e_dur, ub + e_dur, f"end_{e_id}")
+                i_var = model.NewIntervalVar(s_var, e_dur, end_var, f"interval_{e_id}")
+                
+                # Distance cost helper: abs(start_var - original_start)
+                diff = model.NewIntVar(-max_shift_min, max_shift_min, f"diff_{e_id}")
+                abs_diff = model.NewIntVar(0, max_shift_min, f"abs_diff_{e_id}")
+                model.Add(diff == s_var - e_start)
+                model.AddAbsEquality(abs_diff, diff)
+                
+                vars[e_id] = {
+                    "start": s_var, "abs_diff": abs_diff, "original_start": e_start,
+                    "priority": p, "summary": e_summary, "duration": e_dur
+                }
+                intervals.append(i_var)
+            else:
+                # Fixed Anchor
+                intervals.append(model.NewIntervalVar(e_start, e_dur, e_end, f"fixed_{e_id}"))
+
+        # 4. Constraints
+        model.AddNoOverlap(intervals)
+
+        # 5. Objective: Minimize weighted disruption
+        # cost = sum(priority_weight * P + distance_weight * shift + ...)
+        w = CONFIG.cost_weights
+        total_cost_vars = []
+        for e_id, v in vars.items():
+            # weight_p = v['priority'] * w.priority
+            # weight_d = w.distance
+            # Simplified cost for OR-Tools (must be integers)
+            # We scale weights by 10 to preserve some precision
+            item_cost = model.NewIntVar(0, 1000000, f"cost_{e_id}")
+            model.Add(item_cost == int(v['priority'] * w.priority) * 10 + int(w.distance) * v['abs_diff'])
+            total_cost_vars.append(item_cost)
+            
+        model.Minimize(sum(total_cost_vars))
+
+        # 6. Solve
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 5.0
+        status = solver.Solve(model)
+
+        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+            proposal_targets = []
+            for e_id, v in vars.items():
+                final_start = solver.Value(v['start'])
+                if final_start != v['original_start']:
+                    proposal_targets.append({
+                        "id": e_id,
+                        "summary": v['summary'],
+                        "new_start": ref_date + datetime.timedelta(minutes=final_start),
+                        "new_end": ref_date + datetime.timedelta(minutes=final_start + v['duration']),
+                        "old_start": ref_date + datetime.timedelta(minutes=v['original_start']),
+                        "breakdown": {} # Breakdown can be re-calculated if needed
+                    })
+            
+            if not proposal_targets: return None
+            
+            return {
+                "targets": proposal_targets,
+                "cost": solver.ObjectiveValue() / 10.0,
+                "reason": "Globally Optimized (OR-Tools)"
+            }
+
+        return None
 
 def get_magic_fix_proposal(service, new_event: EventDetails, conflicts: list):
-    """Checks if an Elite Magic Fix (auto-reschedule) is possible."""
+    """Refactored to use formal OptimizationEngine instead of brute heuristic."""
     if not conflicts: return None
     
-    # Step 1: Identify movable events
-    movable = []
-    for c in conflicts:
-        if _eval_priority(c.get('summary', '')) < new_event.priority:
-            movable.append(c)
+    # 1. Fetch search context (all events for that day)
+    local_tz = tz.gettz(CONFIG.timezone)
+    start_dt = parser.parse(new_event.start).replace(hour=0, minute=0, second=0)
+    end_dt = start_dt + datetime.timedelta(days=1)
+    
+    try:
+        all_day_events = list_upcoming_events(service, start_dt.isoformat(), end_dt.isoformat())
+        # Filter out the 'new_event' if it was somehow already there (though unlikely here)
+        all_day_events = [e for e in all_day_events if e.get('summary') != new_event.title]
+    except Exception as e:
+        logger.error(f"Failed to fetch day context for OR-Tools: {e}")
+        return None
+
+    # 2. Invoke Solver
+    proposal = OptimizationEngine.solve_scheduling_problem(service, new_event, conflicts, all_day_events)
+    
+    if proposal:
+        # Re-calculate breakdowns for each target for UI transparency
+        for t in proposal['targets']:
+            _, breakdown = _calculate_move_cost(t, t['old_start'], t['new_start'])
+            t['breakdown'] = breakdown
+        return proposal
+
+    return None
+
+
+class LearningEngine:
+    """Adaptive intelligence that learns from user scheduling feedback."""
+    
+    @staticmethod
+    def apply_feedback(accepted: bool, proposal: dict):
+        lr = CONFIG.learning_rate
+        w = CONFIG.cost_weights
+        
+        # Track statistics in BehaviorState
+        if accepted:
+            CONFIG.behavior.accepted_fixes += 1
         else:
-            return None
-            
-    if len(movable) < len(conflicts): return None
-    
-    proposals = []
-    
-    # Step 2: Try single-move solutions
-    for target in movable:
-        t_s = parser.parse(target['start'].get('dateTime', target['start'].get('date')))
-        t_e = parser.parse(target['end'].get('dateTime', target['end'].get('date')))
-        dur = int((t_e - t_s).total_seconds() / 60)
+            CONFIG.behavior.rejected_fixes += 1
+        CONFIG.behavior.total_moves += 1
+        CONFIG.behavior.last_interaction = datetime.datetime.now().isoformat()
         
-        if len(conflicts) == 1:
-            suggestions = find_free_slots(service, new_event.end, min_duration_mins=dur)
-            for slot_start, slot_end in suggestions[:3]:
-                if check_conflicts(service, slot_start.isoformat(), slot_end.isoformat()): continue
-                    
-                cost = _calculate_move_cost(target, t_s, slot_start)
-                if (slot_start - t_s).total_seconds() / 3600 > CONFIG.max_shift_hours: continue
-                    
-                proposals.append({
-                    "targets": [{
-                        "id": target['id'], "summary": target['summary'],
-                        "new_start": slot_start, "new_end": slot_end, "old_start": t_s
-                    }],
-                    "cost": cost,
-                    "reason": f"Optimal single move (Cost: {int(cost)})"
-                })
+        targets = proposal.get('targets', [])
+        if not targets: return
 
-    # Step 3: Try multi-move solutions (Explore Top 3 Gap Combinations)
-    if len(movable) > 1:
-        total_dur = sum((parser.parse(c['end'].get('dateTime', c['end'].get('date'))) - 
-                        parser.parse(c['start'].get('dateTime', c['start'].get('date')))).total_seconds() / 60 for c in movable)
-        
-        combined_suggestions = find_free_slots(service, new_event.end, min_duration_mins=int(total_dur))
-        for s_start, _ in combined_suggestions[:3]: # Non-Linear: Explore different gaps
-            current_ptr = s_start
-            multi_targets = []
-            valid_multi = True
-            for target in movable:
-                t_s = parser.parse(target['start'].get('dateTime', target['start'].get('date')))
-                t_e = parser.parse(target['end'].get('dateTime', target['end'].get('date')))
-                t_dur = t_e - t_s
-                
-                new_t_s = current_ptr
-                new_t_e = current_ptr + t_dur
-                
-                if (new_t_s - t_s).total_seconds() / 3600 > CONFIG.max_shift_hours:
-                    valid_multi = False; break
-                
-                if check_conflicts(service, new_t_s.isoformat(), new_t_e.isoformat()):
-                     valid_multi = False; break
-
-                multi_targets.append({
-                    "id": target['id'], "summary": target['summary'],
-                    "new_start": new_t_s, "new_end": new_t_e, "old_start": t_s
-                })
-                current_ptr = new_t_e
+        # Simple Reinforcement: Adjust weights based on component contribution
+        for t in targets:
+            b = t.get('breakdown', {})
+            if not b: continue
             
-            if valid_multi:
-                total_cost = sum(_calculate_move_cost(c, parser.parse(c['start'].get('dateTime', c['start'].get('date'))), mt['new_start']) 
-                               for c, mt in zip(movable, multi_targets))
-                proposals.append({
-                    "targets": multi_targets,
-                    "cost": (total_cost / len(movable)) + 5, # Complexity penalty
-                    "reason": f"Elite Chain Fix: Optimized across multiple gaps (Cost: {int(total_cost)})"
-                })
+            if not accepted:
+                # User rejected this move -> Increase 'pain' perception for what we moved
+                # Normalizing values to avoid explosive growth
+                w.priority += lr * (b['priority_val'] / 2.0)
+                w.distance += lr * min(b['distance_val'], 4.0)
+                w.duration += lr * (b['duration_val'] / 45.0)
+                if b['bias'] > 0:
+                    CONFIG.preferences.bias_strength += lr * 2
+                logger.info("Adaptive Engine: User rejected proposal. Increasing avoidance weights.")
+            else:
+                # User accepted -> Validate current weights or slightly nudge down for efficiency
+                w.priority = max(10.0, w.priority - (lr * 0.2))
+                w.distance = max(2.0, w.distance - (lr * 0.2))
+                w.duration = max(0.1, w.duration - (lr * 0.05))
+                logger.info("Adaptive Engine: User accepted proposal. Refining scheduling efficiency.")
 
-    if not proposals: return None
-    return min(proposals, key=lambda p: p['cost'])
+        save_config(CONFIG)
 
 
 

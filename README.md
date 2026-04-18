@@ -1,6 +1,6 @@
-# 🐢 LazyScheduler
+# 🐢 LazyScheduler [Phase 1]
 
-LazyScheduler is a **local-first, preference-aware AI scheduling engine** that bridges the gap between natural language intent and structured calendar management. Designed for power users who value privacy, it interfaces directly with the Google Calendar API while keeping all intelligent parsing entirely local.
+LazyScheduler is a **local-first, preference-aware AI scheduling engine** that bridges the gap between natural language intent and structured calendar management. This version (Phase 1) focuses on core engine stability, dual-engine parsing, and local intelligence.
 
 ---
 

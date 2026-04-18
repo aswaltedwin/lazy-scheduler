@@ -4,15 +4,14 @@ from unittest.mock import MagicMock
 from core import find_free_slots
 from config import CONFIG
 
-def test_find_free_slots_no_busy_data():
+def test_find_free_slots_no_busy_data(mock_service):
     CONFIG.timezone = "Asia/Kolkata"
     CONFIG.working_start = 9
     CONFIG.working_end = 19
     local_tz = tz.gettz(CONFIG.timezone)
     
-    service = MagicMock()
     # Mock freebusy response with no busy intervals
-    service.freebusy().query().execute.return_value = {
+    mock_service.freebusy().query().execute.return_value = {
         'calendars': {
             'primary': {
                 'busy': []
@@ -24,7 +23,7 @@ def test_find_free_slots_no_busy_data():
     # Search starting tomorrow at 10 AM
     start_search = day_target.replace(hour=10, minute=0, second=0, microsecond=0).isoformat()
     
-    slots = find_free_slots(service, start_search)
+    slots = find_free_slots(mock_service, start_search)
     
     assert len(slots) > 0
     # First slot should start at the search time and go to end of working day
@@ -32,13 +31,12 @@ def test_find_free_slots_no_busy_data():
     assert s_start.hour == 10
     assert s_end.hour == 19
 
-def test_find_free_slots_with_busy_interval():
+def test_find_free_slots_with_busy_interval(mock_service):
     CONFIG.timezone = "Asia/Kolkata"
     CONFIG.working_start = 9
     CONFIG.working_end = 19
     local_tz = tz.gettz(CONFIG.timezone)
     
-    service = MagicMock()
     now = datetime.datetime.now(local_tz)
     day_target = now + datetime.timedelta(days=1)
     
@@ -46,7 +44,7 @@ def test_find_free_slots_with_busy_interval():
     b_s = day_target.replace(hour=12, minute=0, second=0, microsecond=0)
     b_e = day_target.replace(hour=14, minute=0, second=0, microsecond=0)
     
-    service.freebusy().query().execute.return_value = {
+    mock_service.freebusy().query().execute.return_value = {
         'calendars': {
             'primary': {
                 'busy': [{'start': b_s.isoformat(), 'end': b_e.isoformat()}]
@@ -56,7 +54,7 @@ def test_find_free_slots_with_busy_interval():
     
     # Search starting tomorrow at 9 AM
     start_search = day_target.replace(hour=9, minute=0, second=0, microsecond=0).isoformat()
-    slots = find_free_slots(service, start_search)
+    slots = find_free_slots(mock_service, start_search)
     
     # Should find slots 9-12 and 14-19 (among others)
     # Filter for tomorrow's slots

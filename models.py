@@ -10,6 +10,12 @@ class UserPreferences(BaseModel):
     time_bias: str = "morning"
     bias_strength: float = 10.0
 
+class BehaviorState(BaseModel):
+    accepted_fixes: int = 0
+    rejected_fixes: int = 0
+    total_moves: int = 0
+    last_interaction: Optional[str] = None
+
 class UserConfig(BaseModel):
     model: str = "qwen2.5:7b"
     timezone: str = "Asia/Kolkata"
@@ -18,8 +24,10 @@ class UserConfig(BaseModel):
     default_duration: int = 45
     max_shift_hours: int = 6
     log_level: str = "INFO"
+    learning_rate: float = 0.5
     cost_weights: CostWeights = Field(default_factory=CostWeights)
     preferences: UserPreferences = Field(default_factory=UserPreferences)
+    behavior: BehaviorState = Field(default_factory=BehaviorState)
 
 class EventDetails(BaseModel):
     action: str = Field("create", description="Action to perform: create, list, delete, update, find_slot")

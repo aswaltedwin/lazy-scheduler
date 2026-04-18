@@ -10,7 +10,8 @@ from config import CONFIG, STATE
 from models import EventDetails
 from core import (
     get_calendar_service, 
-    parse_natural_language, 
+    parse_natural_language,
+    ParsingError, 
     check_conflicts, 
     find_free_slots, 
     create_event,
@@ -20,7 +21,8 @@ from core import (
     update_event,
     get_magic_fix_proposal,
     logger,
-    _calculate_move_cost
+    _calculate_move_cost,
+    LearningEngine
 )
 
 console = Console()
@@ -74,7 +76,7 @@ def show_schedule_table(events):
 
 def main():
     """Main CLI interaction loop."""
-    console.print(Panel(f"Model: [bold cyan]{CONFIG.model}[/bold cyan] | Timezone: [bold magenta]{CONFIG.timezone}[/bold magenta]", title="🐢 [bold]LazyScheduler[/bold]", border_style="green"))
+    console.print(Panel(f"Model: [bold cyan]{CONFIG.model}[/bold cyan] | Timezone: [bold magenta]{CONFIG.timezone}[/bold magenta]", title="🐢 [bold]LazyScheduler Phase 1[/bold]", border_style="green"))
     
     try:
         service = get_calendar_service()
@@ -95,6 +97,25 @@ def main():
             # Core AI Parsing
             try:
                 event = parse_natural_language(user_input, context=STATE.last_event)
+            except ParsingError as pe:
+                console.print(f"\n[bold red]Parsing Error:[/bold red] {pe}")
+                if pe.suggestion:
+                    console.print(Panel(
+                        f"I'm not sure I got that. Did you mean:\n[bold cyan]'{pe.suggestion}'[/bold cyan]\n\n[dim](Press Enter to use this, or type something else)[/dim]",
+                        title="💡 Suggestion", border_style="cyan", expand=False
+                    ))
+                    followup = console.input("[bold yellow]Correction > [/bold yellow]").strip()
+                    if followup == "":
+                        # Use the suggestion
+                        event = parse_natural_language(pe.suggestion, context=STATE.last_event)
+                    else:
+                        # Start over with new input
+                        user_input = followup
+                        # We need to loop back manually or handle this input immediately.
+                        # For simplicity, we just process 'followup' as the next command.
+                        event = parse_natural_language(followup, context=STATE.last_event)
+                else:
+                    continue
             except ValueError as ve:
                 console.print(f"[bold red]Parsing Error:[/bold red] {ve}")
                 continue
@@ -209,31 +230,36 @@ def main():
                         from rich.table import Table
                         targets = magic_proposal['targets']
                         
-                        table = Table(title="🧙 Magic Fix: Schedule Impact Preview", title_style="bold cyan", border_style="dim")
+                        table = Table(title="🧙 Magic Fix: Adaptive Schedule Impact", title_style="bold cyan", border_style="dim")
                         table.add_column("Event", style="bold white")
-                        table.add_column("Original Time", style="dim")
+                        table.add_column("Priority", justify="center")
                         table.add_column("Proposed New Time", style="green")
                         table.add_column("Shift", justify="right")
-                        table.add_column("Cost", justify="right")
+                        table.add_column("Pain Score", justify="right", style="bold")
                         
-                        total_cost = 0
                         for t in targets:
                             shift_mins = int((t['new_start'] - t['old_start']).total_seconds() / 60)
-                            cost = _calculate_move_cost({'summary': t['summary'], 'priority': 2, 'start': {'dateTime': t['old_start'].isoformat()}, 'end': {'dateTime': t['old_start'].isoformat()}}, t['old_start'], t['new_start']) # Simplified for display
-                            total_cost += cost
+                            b = t.get('breakdown', {})
+                            
+                            # Build a mini breakdown string for the cost column
+                            score_details = f"{int(t.get('breakdown', {}).get('priority', 0) + t.get('breakdown', {}).get('distance', 0) + t.get('breakdown', {}).get('duration', 0) + t.get('breakdown', {}).get('bias', 0))}"
+                            
                             table.add_row(
                                 t['summary'],
-                                t['old_start'].strftime("%H:%M"),
+                                f"P{int(b.get('priority_val', 2))}",
                                 t['new_start'].strftime("%H:%M"),
                                 f"{shift_mins}m",
-                                f"{int(cost)}"
+                                score_details
                             )
                         
                         console.print(table)
                         console.print(f"   [dim]Strategy: {magic_proposal['reason']}[/dim]")
-                        console.print(f"   [italic]Total Disruption Cost: [bold white]{int(magic_proposal['cost'])}[/bold white][/italic]\n")
                         
-                        if console.input("   [white]Apply these shifts to make room? (y/n): [/white]").strip().lower() in ['y', 'yes', '']:
+                        if CONFIG.behavior.accepted_fixes > 0:
+                            console.print(f"   [italic dim]System has learned from {CONFIG.behavior.accepted_fixes} previous successes.[/italic dim]")
+
+                        choice = console.input("\n   [white]Apply these shifts to make room? (y/n): [/white]").strip().lower()
+                        if choice in ['y', 'yes', '']:
                             console.print("   [dim]Applying atomic transaction...[/dim]")
                             for t in targets:
                                 update_event(service, t['id'], EventDetails(
@@ -243,6 +269,10 @@ def main():
                                 ))
                             console.print(f"   [green]✨ Successfully shifted {len(targets)} event(s).[/green]")
                             applied_fix = True
+                            LearningEngine.apply_feedback(True, magic_proposal)
+                        else:
+                            console.print("   [dim]Feedback captured. Adjusting weights...[/dim]")
+                            LearningEngine.apply_feedback(False, magic_proposal)
 
 
 
