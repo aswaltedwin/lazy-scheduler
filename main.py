@@ -190,6 +190,24 @@ def main():
                     STATE.last_event = None
                 
                 else: # create action
+                    # 🔍 PROACTIVE RISK ASSESSMENT
+                    with console.status("[bold blue]Assessing proactive risks...", spinner="point"):
+                        risk = StrategicPartner.assess_proactive_risk(service, event)
+                    
+                    if risk['level'] != "low":
+                        color = "red" if risk['level'] == "high" else "yellow"
+                        status_msg = "🚨 [bold red]High-Risk Detection[/bold red]" if risk['level'] == "high" else "🧠 [bold yellow]Proactive Insight[/bold yellow]"
+                        reasons_str = "\n".join([f" [bold {color}]•[/bold {color}] {r}" for r in risk['reasons']])
+                        console.print(Panel(Group(f"{status_msg}", "", reasons_str), title="✨ [bold]Assistant Briefing[/bold]", border_style=color))
+                        
+                        if risk['alternative']:
+                            s_start, s_end = risk['alternative']
+                            console.print(f"\n[bold cyan]💡 PREVENTATIVE SUGGESTION:[/bold cyan] Switch to [bold green]{s_start.strftime('%H:%M')}[/bold green] to avoid friction?")
+                            if console.input("   [bold yellow]Accept Recommendation? (y/n) > [/bold yellow]").strip().lower() in ['y', 'yes']:
+                                dur = parser.parse(event.end) - parser.parse(event.start)
+                                event.start, event.end = s_start.isoformat(), (s_start + dur).isoformat()
+                                console.print("[green]✨ Proactive Pivot Applied.[/green]")
+
                     pending_updates = []; applied_fix = False; event_parts = []
                     
                     with console.status("[bold cyan]Checking conflicts...", spinner="simpleDots"):

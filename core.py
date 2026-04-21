@@ -682,14 +682,120 @@ class StrategicPartner:
         if forbidden:
             intelligence_brief = f" [bold cyan](Deep Adaptation: Avoiding {', '.join(forbidden)} based on your rejection history)[/bold cyan]"
         
+        
+        # Keyword-aware context injection
+        targets = proposal.get('targets', [])
+        found_keywords = []
+        
+        # Scan targets (new/moved events)
+        for t in targets:
+            summary = t.get('summary', '').lower()
+            for k in PriorityScorer.SCORING_MATRIX.keys():
+                if k in summary: found_keywords.append(k)
+        
+        # Scan conflicts (blockers)
+        for c in conflicts:
+            summary = c.get('summary', '').lower()
+            for k in PriorityScorer.SCORING_MATRIX.keys():
+                if k in summary: found_keywords.append(k)
+                
+        key_context = f" involving your {found_keywords[0]}" if found_keywords else ""
+
         if strategy == "guardian":
-            return "I am protecting your existing anchors while finding a surgical gap for this request." + intelligence_brief
+            return f"I am protecting your {found_keywords[0] if found_keywords else 'existing anchors'} while finding a surgical gap for this request." + intelligence_brief
         if strategy == "swapper":
-            return "Since your day is dense, I've swapped a lower priority task to make space." + intelligence_brief
+            return f"Since your day is dense, I've swapped a lower priority task to make space for your {found_keywords[0] if found_keywords else 'new event'}." + intelligence_brief
         if strategy == "evictor" and fixed_ids:
-            return "Because you locked specific items, I had to displace a medium-priority task to ensure feasibility." + intelligence_brief
+            return f"Because you locked specific items, I had to displace a medium-priority task to protect your {found_keywords[0] if found_keywords else 'schedule priority'}." + intelligence_brief
         
         return "I've optimized this path to minimize shift costs while respecting your constraints." + intelligence_brief
+
+    @staticmethod
+    def assess_proactive_risk(service, event: EventDetails) -> Dict[str, Any]:
+        """Predicts and prevents scheduling friction before it happens."""
+        local_tz = tz.gettz(CONFIG.timezone)
+        try:
+            start_dt = parser.parse(event.start)
+            if start_dt.tzinfo is None: start_dt = start_dt.replace(tzinfo=local_tz)
+        except Exception:
+            return {"level": "low", "reasons": [], "suggest_alt": False}
+
+        tod = _get_time_of_day(start_dt.hour)
+        reasons = []
+        risk_level = "low"
+        
+        # 1. Behavioral Prediction: History of rejection?
+        misses = PROFILE.time_misses.get(tod, 0)
+        hits = PROFILE.time_hits.get(tod, 0)
+        if (misses - hits) >= 3:
+            risk_level = "medium"
+            reasons.append(f"Behavioral Friction: You have rejected {misses} items in the {tod} recently.")
+
+        # 2. Structural Prediction: Day Health Impact?
+        day_start = start_dt.replace(hour=0, minute=0, second=0).isoformat()
+        day_end = (start_dt + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0).isoformat()
+        
+        day_events = []
+        if service:
+            try:
+                day_events = list_upcoming_events(service, day_start, day_end)
+            except: pass
+        
+        current_health = StrategicPartner.calculate_day_health(day_events)
+        
+        # Hypothetical Health (add new event to the list)
+        hypothetical_events = day_events + [{"summary": event.title, "start": {"dateTime": event.start}, "end": {"dateTime": event.end}}]
+        new_health = StrategicPartner.calculate_day_health(hypothetical_events)
+        
+        if new_health['status'] == "Gridlocked" and current_health['status'] != "Gridlocked":
+            risk_level = "high"
+            reasons.append("Structural Strain: This addition will cause total schedule gridlock.")
+        elif new_health['status'] == "Fragile" and current_health['status'] == "Stable":
+            if risk_level != "high": risk_level = "medium"
+            reasons.append("Health Degradation: This event exhausts your remaining flexible time.")
+
+        # 3. Conflict Prediction: Hard Blockage?
+        conflicts = []
+        if service:
+            try:
+                conflicts = check_conflicts(service, event.start, event.end)
+            except: pass
+            
+        if conflicts:
+            risk_level = "high"
+            # Keyword-Aware Conflict detection
+            found_keywords = []
+            for c in conflicts:
+                c_title = c.get('summary', '').lower()
+                for k in PriorityScorer.SCORING_MATRIX:
+                    if k in c_title: found_keywords.append(k)
+            
+            if found_keywords:
+                reasons.append(f"Hard Conflict: This conflicts with your usual [bold]{found_keywords[0]} time[/bold].")
+            else:
+                reasons.append(f"Hard Conflict: {len(conflicts)} event(s) already occupy this slot.")
+
+        # 4. Proactive Alternative Discovery
+        alt_slot = None
+        if risk_level != "low":
+            # Search for a better slot (Stable zone)
+            all_slots = find_free_slots(service, event.start, min_duration_mins=45)
+            if all_slots:
+                for s_start, s_end in all_slots:
+                    s_tod = _get_time_of_day(s_start.hour)
+                    # Check if this slot is better behaviorally
+                    if (PROFILE.time_hits.get(s_tod, 0) - PROFILE.time_misses.get(s_tod, 0)) >= 0:
+                        alt_slot = (s_start, s_end)
+                        break
+
+        return {
+            "level": risk_level,
+            "reasons": reasons,
+            "current_health": current_health,
+            "new_health": new_health,
+            "suggest_alt": risk_level != "low",
+            "alternative": alt_slot
+        }
 
 class OptimizationEngine:
     """Formal constraint optimization engine powered by Google OR-Tools."""
@@ -839,13 +945,23 @@ class OptimizationEngine:
         
         total_cost_vars = []
         
-        # Dominant Adaptation Logic: Identify categories reaching the dominance threshold
+        # Dominant Adaptation Logic: Identify categories reaching dominance thresholds
         forbidden_categories = []
+        hard_forbidden_categories = []
         loved_categories = []
         for tod, misses in PROFILE.time_misses.items():
             hits = PROFILE.time_hits.get(tod, 0)
-            if (misses - hits) >= getattr(PROFILE, "dominance_threshold", 5):
+            diff = misses - hits
+            
+            # Hard "Instinctive" Elimination (Threshold: hard_dominance_threshold)
+            if diff >= getattr(PROFILE, "hard_dominance_threshold", 10):
+                hard_forbidden_categories.append(tod)
+                forbidden_categories.append(tod) # Also a soft-penalty fallback
+            
+            # Soft Adaptation (Threshold: dominance_threshold)
+            elif diff >= getattr(PROFILE, "dominance_threshold", 5):
                 forbidden_categories.append(tod)
+                
             elif (hits - misses) >= getattr(PROFILE, "dominance_threshold", 5):
                 loved_categories.append(tod)
 
@@ -861,7 +977,7 @@ class OptimizationEngine:
             confidence_mult = 2 if (hits + misses) > 5 else 1
             
             # Base preference cost
-            cost = -time_bias * 250 * confidence_mult
+            cost = int(-time_bias * 250 * confidence_mult)
             
             # DOMINANT OVERRIDE: Extreme penalties for forbidden categories (P2/P3)
             if tod in forbidden_categories:
@@ -876,7 +992,14 @@ class OptimizationEngine:
             hour_var = model.NewIntVar(0, 23, f"hour_{e_id}")
             model.AddDivisionEquality(hour_var, v['start'], 60)
             
-            # DOMINANT OVERRIDE: Hard constraints for Low Priority (P1) events
+            # 3.1 INSTINCTIVE ELIMINATION: Hard constraints for ALL events in highly-rejected slots
+            for h in range(24):
+                tod = _get_time_of_day(h)
+                if tod in hard_forbidden_categories:
+                    model.Add(hour_var != h)
+                    logger.info(f"Instinctive Avoidance: Eliminating hour {h} ({tod}) for '{v['summary']}' due to strong rejection history.")
+
+            # 3.2 DOMINANT OVERRIDE: Hard constraints for Low Priority (P1) events in moderately-rejected slots
             if v['priority'] <= 1:
                 for h in range(24):
                     if _get_time_of_day(h) in forbidden_categories:
@@ -1138,12 +1261,12 @@ class DecisionEngine:
             shift_mins = b.get('shift_mins', 0)
             
             if req_p > p_val:
-                reasons.append(f"• [bold]Priority Trade-off[/bold]: Protected '{new_event.title}' (P{req_p}) vs '{t['summary']}' (P{p_val}).")
+                reasons.append(f"• I prioritized your [bold]{new_event.title}[/bold] over '{t['summary']}'.")
             elif req_p == p_val:
-                reasons.append(f"• [bold]Fairness Resolve[/bold]: Balanced sacrifice for equal-priority tasks (P{req_p}).")
+                reasons.append(f"• Making space for this by shifting '{t['summary']}' slightly.")
             
             if shift_mins > 0:
-                reasons.append(f"• [bold]Surgical Shift[/bold]: '{t['summary']}' displaced by exactly {shift_mins}m to clear slot.")
+                reasons.append(f"• Displaced '{t['summary']}' by {shift_mins}m to clear your slot.")
 
         # 4. Behavioral Evidence
         avg_bias = sum([t.get('breakdown', {}).get('bias_points', 0) for t in targets]) / len(targets) if targets else 0

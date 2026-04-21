@@ -33,6 +33,7 @@ class UserProfile(BaseModel):
     })
     locked_titles: Dict[str, int] = Field(default_factory=dict)
     dominance_threshold: int = 5
+    hard_dominance_threshold: int = 10
 
 class UserConfig(BaseModel):
     model: str = "qwen2.5:7b"
