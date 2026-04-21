@@ -16,6 +16,24 @@ class BehaviorState(BaseModel):
     total_moves: int = 0
     last_interaction: Optional[str] = None
 
+class UserProfile(BaseModel):
+    preferred_hours: List[int] = Field(default_factory=lambda: [9, 10, 11])
+    avoid_hours: List[int] = Field(default_factory=lambda: [13])
+    priority_bias: float = 1.2
+    accepted_moves: List[str] = Field(default_factory=list)
+    rejected_moves: List[str] = Field(default_factory=list)
+    time_preferences: Dict[str, float] = Field(default_factory=lambda: {
+        "morning": 0.0, "afternoon": 0.0, "evening": 0.0, "night": 0.0
+    })
+    time_hits: Dict[str, int] = Field(default_factory=lambda: {
+        "morning": 0, "afternoon": 0, "evening": 0, "night": 0
+    })
+    time_misses: Dict[str, int] = Field(default_factory=lambda: {
+        "morning": 0, "afternoon": 0, "evening": 0, "night": 0
+    })
+    locked_titles: Dict[str, int] = Field(default_factory=dict)
+    dominance_threshold: int = 5
+
 class UserConfig(BaseModel):
     model: str = "qwen2.5:7b"
     timezone: str = "Asia/Kolkata"

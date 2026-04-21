@@ -1,27 +1,26 @@
-# Python Environment
+# 🔐 Security & Secrets
+.env
+credentials.json
+token.json
+
+# 📝 Logs & Runtime Data
+*.log
+scheduler.log
+logs/
+
+# ⚙️ Local Configuration
+config.json
+
+# 🐢 Python Environment
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.env
 .venv/
 env/
 venv/
 build/
 dist/
 *.egg-info/
-
-# 🔐 Sensitive Google API Files (DO NOT COMMIT)
-credentials.json
-token.json
-
-# ⚙️ Local Configuration
-config.json
-
-# 📝 Logs & Runtime Data
-*.log
-scheduler.log
-logs/
 
 # 🖥️ IDE & Editor Settings
 .vscode/
@@ -34,3 +33,6 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# 📦 Version Control Control
+.git/

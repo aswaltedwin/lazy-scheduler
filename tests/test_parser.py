@@ -22,7 +22,7 @@ def test_rule_based_parser_find_free_time():
     result = RuleBasedParser.parse("any free slots today?")
     assert result is not None
     assert result.action == "find_slot"
-    assert result.duration_mins == 0
+    assert result.duration_mins == 30
 
 def test_rule_based_parser_delete_simple():
     result = RuleBasedParser.parse("delete lunch")

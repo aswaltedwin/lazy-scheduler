@@ -1,7 +1,9 @@
+import os
 import datetime
 import logging
+import time
 from dateutil import parser
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 
@@ -19,10 +21,13 @@ from core import (
     find_event,
     delete_event,
     update_event,
-    get_magic_fix_proposal,
+    get_magic_fix_proposals,
     logger,
     _calculate_move_cost,
-    LearningEngine
+    LearningEngine,
+    OptimizationEngine,
+    PriorityScorer,
+    StrategicPartner
 )
 
 console = Console()
@@ -48,13 +53,13 @@ def show_event_panel(event: EventDetails, title="Proposed Event"):
     console.print(Panel(content, title=f"[bold cyan]{title}[/bold cyan]", border_style="cyan", expand=False))
 
 def show_schedule_table(events):
-    """Displays user events in a clean ASCII table."""
+    """Displays user events in a clean panel-wrapped table."""
     if not events:
         console.print("[yellow]No upcoming events found.[/yellow]")
         return
-    table = Table(title="Your Schedule", show_header=True, header_style="bold magenta", box=None)
+    table = Table(show_header=True, header_style="bold magenta", box=None, expand=True)
     table.add_column("Date/Time", style="dim", width=22)
-    table.add_column("Event")
+    table.add_column("Event", style="bold white")
     
     for event in events:
         start_raw = event['start'].get('dateTime', event['start'].get('date'))
@@ -70,276 +75,222 @@ def show_schedule_table(events):
             
         time_str = f"{date_part} [bold]|[/bold] {time_part}"
         table.add_row(time_str, event['summary'])
-
     
-    console.print(table)
+    console.print(Panel(table, title="📅 [bold cyan]Your Schedule[/bold cyan]", border_style="cyan", padding=(1, 2)))
+
+def show_optimization_comparison(original, targets):
+    """Displays a side-by-side comparison of the optimization moves."""
+    table = Table(title="🚀 Optimization Impact Assessment", title_style="bold magenta", show_header=True, header_style="bold cyan", box=None)
+    table.add_column("Event", style="bold white")
+    table.add_column("Original Time", style="dim")
+    table.add_column("Optimization Move", style="bold green")
+    table.add_column("Shift", justify="right")
+    
+    # Create a lookup for original times
+    orig_map = {e['id']: e for e in original}
+    
+    for t in targets:
+        orig = orig_map.get(t['id'], {})
+        o_start_raw = orig.get('start', {}).get('dateTime', orig.get('start', {}).get('date', ''))
+        o_start = parser.parse(o_start_raw).strftime('%H:%M') if o_start_raw else "N/A"
+        
+        n_start = t['new_start'].strftime('%H:%M')
+        shift_mins = int((t['new_start'] - parser.parse(o_start_raw)).total_seconds() / 60) if o_start_raw else 0
+        
+        table.add_row(
+            t['summary'],
+            o_start,
+            f"{o_start} [dim]→[/dim] [bold green]{n_start}[/bold green]",
+            f"{shift_mins:+d}m"
+        )
+    
+    console.print(Panel(table, border_style="magenta", padding=(1, 2)))
 
 def main():
-    """Main CLI interaction loop."""
-    console.print(Panel(f"Model: [bold cyan]{CONFIG.model}[/bold cyan] | Timezone: [bold magenta]{CONFIG.timezone}[/bold magenta]", title="🐢 [bold]LazyScheduler Phase 1[/bold]", border_style="green"))
+    """Main CLI interaction loop with basic session hygiene."""
+    console.print(Panel(f"Model: [bold cyan]{CONFIG.model}[/bold cyan] | Timezone: [bold magenta]{CONFIG.timezone}[/bold magenta]", title="🐢 [bold]LazyScheduler V1.0[/bold]", border_style="green"))
     
+    service = None
     try:
-        service = get_calendar_service()
-    except Exception as e:
-        logger.error(f"Initialization Failed: {e}")
-        console.print(f"[bold red]Critical Error:[/bold red] Could not connect to Google Calendar. See logs.")
-        return
-
-    while True:
         try:
-            prefix = "[bold yellow]🔨 (Edit Mode)[/bold yellow] " if STATE.last_event else ""
-            user_input = console.input(f"\n{prefix}[bold green]You:[/bold green] ").strip()
-            
-            if user_input.lower() in ['quit', 'exit', 'q']:
-                console.print("[yellow]👋 Stopped.[/yellow]"); break
-            if not user_input: continue
+            service = get_calendar_service()
+        except Exception as e:
+            logger.error(f"Initialization Failed: {e}")
+            console.print(f"[bold red]Critical Error:[/bold red] Could not connect to Google Calendar. See logs.")
+            return
 
-            # Core AI Parsing
+        while True:
             try:
-                event = parse_natural_language(user_input, context=STATE.last_event)
-            except ParsingError as pe:
-                console.print(f"\n[bold red]Parsing Error:[/bold red] {pe}")
-                if pe.suggestion:
-                    console.print(Panel(
-                        f"I'm not sure I got that. Did you mean:\n[bold cyan]'{pe.suggestion}'[/bold cyan]\n\n[dim](Press Enter to use this, or type something else)[/dim]",
-                        title="💡 Suggestion", border_style="cyan", expand=False
-                    ))
-                    followup = console.input("[bold yellow]Correction > [/bold yellow]").strip()
-                    if followup == "":
-                        # Use the suggestion
-                        event = parse_natural_language(pe.suggestion, context=STATE.last_event)
-                    else:
-                        # Start over with new input
-                        user_input = followup
-                        # We need to loop back manually or handle this input immediately.
-                        # For simplicity, we just process 'followup' as the next command.
-                        event = parse_natural_language(followup, context=STATE.last_event)
-                else:
+                prefix = f"[bold yellow]🔨 ({STATE.last_event.title})[/bold yellow] " if STATE.last_event else ""
+                user_input = console.input(f"\n{prefix}[bold green]You:[/bold green] ").strip()
+                
+                if user_input.lower() in ['quit', 'exit', 'q']:
+                    console.print("[yellow]👋 Stopped.[/yellow]"); break
+                if not user_input: continue
+
+                try:
+                    event = parse_natural_language(user_input, context=STATE.last_event)
+                except ParsingError as pe:
+                    console.print(f"\n[bold red]Parsing Error:[/bold red] {pe}")
+                    if pe.suggestion:
+                        console.print(Panel(f"I'm not sure I got that. Did you mean:\n[bold cyan]'{pe.suggestion}'[/bold cyan]", title="💡 Suggestion", border_style="cyan", expand=False))
+                        followup = console.input("[bold yellow]Correction > [/bold yellow]").strip()
+                        if followup == "": event = parse_natural_language(pe.suggestion, context=STATE.last_event)
+                        else: event = parse_natural_language(followup, context=STATE.last_event)
+                    else: continue
+                except ValueError as ve:
+                    console.print(f"[bold red]Parsing Error:[/bold red] {ve}"); continue
+                
+                if event.action == "optimize_day":
+                    with console.status("[bold magenta]Re-evaluating entire day...", spinner="bouncingBar"):
+                         result = OptimizationEngine.optimize_day_transaction(service, "")
+                    if "error" in result: console.print(f"[bold yellow]Optimization Engine:[/bold yellow] {result['error']}"); continue
+                    
+                    show_optimization_comparison(result['original_events'], result['targets'])
+                    
+                    if console.input(f"\n[bold green]Apply all {len(result['targets'])} changes?[/bold green] (y/n): ").lower() in ['y', 'yes']:
+                        for t in result['targets']:
+                            update_event(service, t['id'], EventDetails(action="update", start=t['new_start'].isoformat(), end=t['new_end'].isoformat()))
+                        console.print(f"[bold green]✨ Day Optimized.[/bold green]")
                     continue
-            except ValueError as ve:
-                console.print(f"[bold red]Parsing Error:[/bold red] {ve}")
-                continue
-            
-            if event.action == "list":
-                try:
+
+                elif event.action == "list":
                     items = list_upcoming_events(service, event.start, event.end)
-                    if event.search_query:
-                        # Filter items by search_query if present
-                        items = [it for it in items if event.search_query.lower() in it.get('summary', '').lower()]
-                    
+                    if event.search_query: items = [it for it in items if event.search_query.lower() in it.get('summary', '').lower()]
                     show_schedule_table(items)
-                except Exception as e:
-                    console.print(f"[bold red]Fetch Error:[/bold red] Could not retrieve schedule. ({e})")
-                STATE.last_event = None
-
-                
-            elif event.action == "find_slot":
-                # Find all free blocks, using the duration explicitly requested (if any)
-                blocks = find_free_slots(service, event.start, min_duration_mins=event.duration_mins)
-
-                if blocks:
-                    console.print(f"\n🆓 [bold]Your Availability:[/bold]")
-                    for i, (s, e) in enumerate(blocks):
-                        dur = e - s
-                        hours, remainder = divmod(int(dur.total_seconds() / 60), 60)
-                        dur_str = f"{hours}h {remainder}m" if hours > 0 else f"{remainder}m"
-                        console.print(f"   {i+1}. {s.strftime('%a, %b %d')}: {s.strftime('%H:%M')} [dim]→[/dim] {e.strftime('%H:%M')} [bold cyan]({dur_str} free)[/bold cyan]")
-                else:
-                    console.print("[yellow]No free blocks found.[/yellow]")
-                STATE.last_event = None
-
-                
-            elif event.action in ["delete", "update"]:
-                # Optimization: If correcting a proposal, handle "update" action as refinement
-                if STATE.last_event and STATE.last_event.action == "create" and event.action == "update":
-                    if not event.search_query or event.search_query.lower() in STATE.last_event.title.lower():
-                        event.action = "create"
-                        show_event_panel(event)
-                        STATE.last_event = event
-                        choice = console.input("\n[bold white]Proceed?[/bold white] ([green]y[/green]- yes, [red]n[/red]- no, [yellow]e[/yellow]- edit): ").strip().lower()
-                        if choice in ['y', 'yes', '']:
-                            res = create_event(service, event)
-                            if res:
-                                msg = "[green]✅ Event Created![/green]\n"
-                                meet_link = next((ep.get('uri') for ep in res.get('conferenceData', {}).get('entryPoints', []) if ep.get('entryPointType') == 'video'), None)
-                                if meet_link: msg += f"📹 [bold cyan]Google Meet:[/bold cyan] [u]{meet_link}[/u]\n"
-                                if res.get('htmlLink'): msg += f"📅 [dim]Calendar Link: {res.get('htmlLink')}[/dim]"
-                                console.print(Panel(msg, border_style="green", expand=False))
-                            else:
-                                console.print("[red]❌ Failed to create event.[/red]")
-                            STATE.last_event = None
-                        elif choice in ['n', 'no']:
-                            console.print("[yellow]Cancelled.[/yellow]")
-                            STATE.last_event = None
-                        elif choice in ['e', 'edit']:
-                            console.print("[dim italic]Processing edit...[/dim italic]")
-                        continue
-
-                matches = find_event(service, event.search_query)
-                
-                # If no specific match by name, check if it's a range delete (e.g., "all tomorrow")
-                if not matches and event.action == "delete" and event.start and event.end:
-                    matches = list_upcoming_events(service, event.start, event.end)
-
-                if not matches:
-                    console.print(f"[yellow]No match found for '{event.search_query}'[/yellow]")
-                elif len(matches) > 1 and event.action == "delete":
-                    # Batch Delete Flow
-                    console.print(f"\n[bold red]🗑️  Batch Delete:[/bold red] Found {len(matches)} events in this range:")
-                    for m in matches:
-                        m_s = m['start'].get('dateTime', m['start'].get('date'))[:16].replace('T', ' ')
-                        console.print(f"   - [bold]{m['summary']}[/bold] at {m_s}")
                     
-                    if console.input(f"\n[bold red]Delete ALL {len(matches)} events?[/bold red] (y/n): ").lower() in ['y', 'yes']:
-                        for m in matches:
-                            delete_event(service, m['id'])
-                        console.print(f"[green]💥 Cleared {len(matches)} events successfully.[/green]")
-                else:
-                    # Single Match Flow
-                    target = matches[0]
-                    target_start = target['start'].get('dateTime', target['start'].get('date'))
-                    console.print(f"🎯 Found: [bold]{target['summary']}[/bold] at {target_start[:16]}")
+                    # Schedule Health Score
+                    if items:
+                        count = len(items)
+                        p3_count = len([it for it in items if PriorityScorer.calculate_priority(it.get('summary','')) >= 3])
+                        score = max(0, 100 - (count * 5) - (p3_count * 10))
+                        color = "green" if score > 70 else "yellow" if score > 40 else "red"
+                        console.print(f"[dim]Schedule Density Score:[/dim] [{color}]{score}%[/{color}] [dim]({count} events, {p3_count} anchors)[/dim]")
                     
-                    prompt = "Update this event? (y/n): " if event.action == "update" else "Delete this event? (y/n): "
-                    if console.input(prompt).lower() in ['y', 'yes']:
-                        try:
-                            if event.action == "delete": 
-                                delete_event(service, target['id'])
-                                console.print(f"[green]🗑️ Deleted successfully: [bold]{target['summary']}[/bold][/green]")
-                            else:
-                                update_event(service, target['id'], event)
-                                console.print(f"[green]🔄 Updated successfully: [bold]{event.title or target['summary']}[/bold][/green]")
-                        except Exception as e:
-                            console.print(f"[bold red]Operation Failed:[/bold red] {e}")
-                STATE.last_event = None
-
+                    STATE.last_event = None
+                    
+                elif event.action == "find_slot":
+                    blocks = find_free_slots(service, event.start, min_duration_mins=event.duration_mins)
+                    if blocks:
+                        for i, (s, e) in enumerate(blocks):
+                            console.print(f"{i+1}. {s.strftime('%H:%M')} [dim]→[/dim] {e.strftime('%H:%M')}")
+                    else: console.print("[yellow]No free blocks found.[/yellow]")
+                    STATE.last_event = None
+                    
+                elif event.action in ["delete", "update"]:
+                    matches = find_event(service, event.search_query)
+                    if not matches: console.print(f"[yellow]No match found for '{event.search_query}'[/yellow]")
+                    else:
+                        target = matches[0]
+                        prompt = "Update this event? (y/n): " if event.action == "update" else "Delete this event? (y/n): "
+                        if console.input(f"🎯 Found: [bold]{target['summary']}[/bold]\n{prompt}").lower() in ['y', 'yes', '']:
+                            if event.action == "delete": delete_event(service, target['id'])
+                            else: update_event(service, target['id'], event)
+                            console.print("[green]✅ Done.[/green]")
+                    STATE.last_event = None
                 
-            else: # create action
-                try:
-                    busy = check_conflicts(service, event.start, event.end)
+                else: # create action
+                    pending_updates = []; applied_fix = False; event_parts = []
+                    
+                    with console.status("[bold cyan]Checking conflicts...", spinner="simpleDots"):
+                        busy = check_conflicts(service, event.start, event.end)
+                    
                     if busy:
                         console.print(f"\n[bold red]⚠️  CONFLICT:[/bold red] You have {len(busy)} event(s) during this time.")
-                except Exception as e:
-                    console.print(f"[bold yellow]⚠️  Warning:[/bold yellow] Could not check for conflicts. ({e})")
-                    busy = []
-                    
-                    # Try Magic Fix
-                    magic_proposal = get_magic_fix_proposal(service, event, busy)
-                    applied_fix = False
-                    if magic_proposal:
-                        from rich.table import Table
-                        targets = magic_proposal['targets']
-                        
-                        table = Table(title="🧙 Magic Fix: Adaptive Schedule Impact", title_style="bold cyan", border_style="dim")
-                        table.add_column("Event", style="bold white")
-                        table.add_column("Priority", justify="center")
-                        table.add_column("Proposed New Time", style="green")
-                        table.add_column("Shift", justify="right")
-                        table.add_column("Pain Score", justify="right", style="bold")
-                        
-                        for t in targets:
-                            shift_mins = int((t['new_start'] - t['old_start']).total_seconds() / 60)
-                            b = t.get('breakdown', {})
+                        fixed_ids = []
+                        while True:
+                            proposals = get_magic_fix_proposals(service, event, busy, fixed_ids=fixed_ids)
+                            if not proposals: break
+
+                            # 🚨 STRATEGIC PARTNER BRIEFING
+                            with console.status("[bold cyan]Analyzing tactical options...", spinner="dots"): 
+                                time.sleep(0.5)
+
+                            # 1. HEADER: Day Health & Autopsy (if failure)
+                            if proposals[0].get('status') == "failure":
+                                diag = proposals[0]
+                                console.print(Panel(Group(f"[bold red]AUTOPSY:[/bold red] {diag['reason']}", "", "[bold cyan]RESCUE STEPS:[/bold cyan]", *[f" {idx+1}. {s}" for idx, s in enumerate(diag['suggestions'])]), title="🚨 Schedule Gridlock Detection", border_style="red"))
+                                break
                             
-                            # Build a mini breakdown string for the cost column
-                            score_details = f"{int(t.get('breakdown', {}).get('priority', 0) + t.get('breakdown', {}).get('distance', 0) + t.get('breakdown', {}).get('duration', 0) + t.get('breakdown', {}).get('bias', 0))}"
+                            health = proposals[0].get('health', {})
+                            health_color = "green" if health['status'] == "Stable" else "yellow" if health['status'] == "Fragile" else "red"
+                            console.print(Panel(f"Status: [{health_color}]{health['status']}[/{health_color}] | Health Score: [{health_color}]{health['score']}%[/{health_color}] | Anchors: {health['anchors']}", title="📊 [bold]Daily Vitality Monitor[/bold]", border_style="slate_blue1"))
+
+                            # 2. PROPOSALS: War Room Dashboard
+                            console.print(f"\n[bold cyan]🧙 Strategic Alternatives Found ({len(proposals)}):[/bold cyan]")
+                            for idx, prop in enumerate(proposals):
+                                table = Table(box=None, header_style="bold dim")
+                                table.add_column("Event", style="bold white", width=25)
+                                table.add_column("New Time", style="green")
+                                table.add_column("Cost", justify="right", style="dim")
+                                
+                                for t in prop['targets']:
+                                    b = t.get('breakdown', {})
+                                    table.add_row(t['summary'], t['new_start'].strftime("%H:%M"), f"{b.get('shift_mins',0)}m")
+                                
+                                advice_panel = Panel(
+                                    Group(
+                                        f"[bold magenta]Strategy:[/bold magenta] {prop['reason']}",
+                                        f"[italic dim]Partner Advice:[/italic dim] {prop.get('tactical_advice', '')}",
+                                        "",
+                                        table
+                                    ),
+                                    title=f"Option {idx+1}",
+                                    border_style="magenta" if idx == 0 else "dim"
+                                )
+                                console.print(advice_panel)
                             
-                            table.add_row(
-                                t['summary'],
-                                f"P{int(b.get('priority_val', 2))}",
-                                t['new_start'].strftime("%H:%M"),
-                                f"{shift_mins}m",
-                                score_details
-                            )
-                        
-                        console.print(table)
-                        console.print(f"   [dim]Strategy: {magic_proposal['reason']}[/dim]")
-                        
-                        if CONFIG.behavior.accepted_fixes > 0:
-                            console.print(f"   [italic dim]System has learned from {CONFIG.behavior.accepted_fixes} previous successes.[/italic dim]")
+                            # 3. NEGOTIATION INPUT
+                            console.print("\n[bold slate_blue1]💡 NEGOTIATION:[/bold slate_blue1] [dim]Select (1-3) or tell me what to protect (e.g. 'Keep my Gym class')[/dim]")
+                            interaction = console.input(f"   [bold yellow]Collaboration > [/bold yellow]").strip()
+                            
+                            if interaction.isdigit() and 1 <= int(interaction) <= len(proposals):
+                                selected = proposals[int(interaction)-1]; applied_fix = True
+                                for t in selected['targets']:
+                                    if t['id'] == "new_event": event.start, event.end = t['new_start'].isoformat(), t['new_end'].isoformat()
+                                    elif t['id'].startswith("split"):
+                                        part = event.model_copy(); part.title = t['summary']; part.start, part.end = t['new_start'].isoformat(), t['new_end'].isoformat()
+                                        event_parts.append(part)
+                                    else: pending_updates.append(t)
+                                LearningEngine.apply_feedback(True, selected)
+                                break
+                            elif interaction:
+                                # Enhanced Intent Extraction via StrategicPartner
+                                intent = StrategicPartner.extract_intent(interaction, busy)
+                                if intent['type'] == "lock_event":
+                                    fixed_ids.append(intent['id'])
+                                    LearningEngine.record_lock(intent['summary'])
+                                    console.print(f"   [cyan]🔒 Strategy Adjusted: Protecting '{intent['summary']}'. Re-solving...[/cyan]"); continue
+                                elif intent['type'] == "constrain_time":
+                                    console.print(f"   [cyan]⏳ Strategy Adjusted: Avoiding {intent['constraint']} slots. Re-solving...[/cyan]"); continue
+                                break
+                            else: break
+                            
+                        if not applied_fix:
+                            suggestions = find_free_slots(service, event.start)
+                            if suggestions:
+                                s_start, s_end = suggestions[0]
+                                if console.input(f"👉 Next free: {s_start.strftime('%H:%M')}. Switch? (y/n): ").strip().lower() in ['y', 'yes', '']:
+                                    dur = parser.parse(event.end) - parser.parse(event.start)
+                                    event.start, event.end = s_start.isoformat(), (s_start + dur).isoformat()
 
-                        choice = console.input("\n   [white]Apply these shifts to make room? (y/n): [/white]").strip().lower()
-                        if choice in ['y', 'yes', '']:
-                            console.print("   [dim]Applying atomic transaction...[/dim]")
-                            for t in targets:
-                                update_event(service, t['id'], EventDetails(
-                                    action="update",
-                                    start=t['new_start'].isoformat(),
-                                    end=t['new_end'].isoformat()
-                                ))
-                            console.print(f"   [green]✨ Successfully shifted {len(targets)} event(s).[/green]")
-                            applied_fix = True
-                            LearningEngine.apply_feedback(True, magic_proposal)
-                        else:
-                            console.print("   [dim]Feedback captured. Adjusting weights...[/dim]")
-                            LearningEngine.apply_feedback(False, magic_proposal)
+                    show_event_panel(event)
+                    STATE.last_event = event
+                    choice = console.input("\n[bold white]Proceed?[/bold white] (y/n/e): ").strip().lower()
+                    if choice in ['y', 'yes', '']:
+                        for t in pending_updates: update_event(service, t['id'], EventDetails(action="update", start=t['new_start'].isoformat(), end=t['new_end'].isoformat()))
+                        if event_parts:
+                            for p in event_parts: create_event(service, p)
+                        else: create_event(service, event)
+                        console.print("[green]✅ Success.[/green]"); STATE.last_event = None
+                    elif choice in ['n', 'no']: STATE.last_event = None
 
-
-
-                    
-                    if not applied_fix:
-                        suggestions = find_free_slots(service, event.start)
-                        if suggestions:
-                            s_start, s_end = suggestions[0]
-                            console.print(f"👉 Next free block: [bold]{s_start.strftime('%a, %b %d at %H:%M')} [dim]→[/dim] {s_end.strftime('%H:%M')}[/bold]")
-                            if console.input("\nSwitch to this time? (y/n): ").strip().lower() in ['y', 'yes']:
-                                dur = parser.parse(event.end) - parser.parse(event.start)
-                                event.start, event.end = s_start.isoformat(), (s_start + dur).isoformat()
-
-
-                show_event_panel(event)
-                STATE.last_event = event
-
-                # Smart Intent: Don't ask for location if it's a task/reminder or 0-duration
-                non_physical_keywords = ["deadline", "reminder", "due", "task", "check", "pay", "buy", "bill", "ship"]
-                is_task = any(k in event.title.lower() for k in non_physical_keywords) or (event.start == event.end)
-
-                if not event.location.strip() and not event.add_meeting and event.action == "create" and not is_task:
-                    prompt = "\n📍 [cyan]Where is this happening?[/cyan] (a- add location, y- skip, n- cancel, e- edit): "
-                else:
-                    prompt = "\n[bold white]Proceed?[/bold white] ([green]y[/green]- yes, [red]n[/red]- no, [yellow]e[/yellow]- edit): "
-
-                choice = console.input(prompt).strip().lower()
-                
-                if choice in ['y', 'yes', '', 'y- yes']:
-                    res = create_event(service, event)
-                    if res:
-                        msg = "[green]✅ Event Created![/green]\n"
-                        meet_link = next((ep.get('uri') for ep in res.get('conferenceData', {}).get('entryPoints', []) if ep.get('entryPointType') == 'video'), None)
-                        if meet_link: msg += f"📹 [bold cyan]Google Meet:[/bold cyan] [u]{meet_link}[/u]\n"
-                        if res.get('htmlLink'): msg += f"📅 [dim]Calendar Link: {res.get('htmlLink')}[/dim]"
-                        console.print(Panel(msg, border_style="green", expand=False))
-                    else:
-                        console.print("[red]❌ Failed to create event.[/red]")
-                    STATE.last_event = None
-                elif choice in ['n', 'no', 'n- no']:
-                    console.print("[yellow]Cancelled.[/yellow]")
-                    STATE.last_event = None
-                elif choice in ['e', 'edit', 'e- edit']:
-                    console.print("[dim italic]Processing edit...[/dim italic]")
-                    continue
-                elif choice in ['a', 'a- add location']:
-                    loc = console.input("   📍 [cyan]Location:[/cyan] ").strip()
-                    if loc:
-                        event.location = loc
-                        console.print(f"[dim]Location set to: {loc}[/dim]")
-                    continue
-                else:
-                    # If location was missing and user typed text directly, treat it as location
-                    if not event.location.strip() and not event.add_meeting:
-                        event.location = choice
-                        console.print(f"[dim]Setting location to: {choice}[/dim]")
-                        continue
-                    
-                    console.print("[dim italic]Processing edit...[/dim italic]")
-                    continue
-
-        except KeyboardInterrupt:
-            console.print("\n[yellow]👋 Goodbye![/yellow]"); break
-        except Exception as e:
-            logger.error(f"Runtime Exception: {e}", exc_info=True)
-            console.print(f"[bold red]Unexpected Error:[/bold red] Check logs for details.")
-            STATE.last_event = None
+            except KeyboardInterrupt: break
+            except Exception as e:
+                logger.error(f"Runtime Error: {e}", exc_info=True)
+                STATE.last_event = None
+    finally:
+        if os.path.exists("token.json"): os.remove("token.json")
 
 if __name__ == "__main__":
     main()
