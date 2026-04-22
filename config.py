@@ -1,72 +1,43 @@
 import os
 import json
 import logging
-from dotenv import load_dotenv
 from models import UserConfig, SessionState, UserProfile
 
-# Load environment variables
-load_dotenv()
+logger = logging.getLogger("lazy-scheduler")
 
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-GOOGLE_PROJECT_ID = os.getenv("GOOGLE_PROJECT_ID", "lazy-scheduler-493410")
+# Path to the consolidated state file
+STATE_PATH = os.path.join('data', 'state.json')
 
-# Environment Validation (Skip if testing)
-if not os.getenv("LAZY_TESTING"):
-    if not GOOGLE_CLIENT_ID:
-        raise Exception("Missing GOOGLE_CLIENT_ID in environment/.env")
-    if not GOOGLE_CLIENT_SECRET:
-        raise Exception("Missing GOOGLE_CLIENT_SECRET in environment/.env")
-
-logger = logging.getLogger("LazyScheduler")
-
-def load_config():
-    """Loads configuration from config.json or returns defaults."""
-    if os.path.exists('config.json'):
+def load_state():
+    """Loads the entire system state from data/state.json."""
+    if os.path.exists(STATE_PATH):
         try:
-            with open('config.json', 'r') as f:
+            with open(STATE_PATH, 'r') as f:
                 data = json.load(f)
-                
-            # Map legacy 'working_hours' block if present
-            working_hours = data.get('working_hours', {})
-            if working_hours:
-                if 'start' in working_hours: data['working_start'] = working_hours['start']
-                if 'end' in working_hours: data['working_end'] = working_hours['end']
             
-            return UserConfig(**data)
+            config = UserConfig(**data.get('config', {}))
+            profile = UserProfile(**data.get('profile', {}))
+            return config, profile
         except Exception as e:
-            logger.error(f"Error loading config.json: {e}. Using defaults.")
-            return UserConfig()
-    return UserConfig()
+            logger.error(f"Error loading state: {e}. Using defaults.")
+            return UserConfig(), UserProfile()
+    
+    # Ensure data directory exists
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    return UserConfig(), UserProfile()
 
-def save_config(config: UserConfig):
-    """Saves current configuration back to config.json."""
+def save_state(config: UserConfig, profile: UserProfile):
+    """Saves the entire system state to data/state.json."""
     try:
-        with open('config.json', 'w') as f:
-            json.dump(config.model_dump(), f, indent=4)
+        data = {
+            "config": config.model_dump(),
+            "profile": profile.model_dump()
+        }
+        with open(STATE_PATH, 'w') as f:
+            json.dump(data, f, indent=4)
     except Exception as e:
-        logger.error(f"Error saving config.json: {e}")
+        logger.error(f"Error saving state: {e}")
 
-def load_profile():
-    """Loads behavior profile from user_profile.json or returns defaults."""
-    if os.path.exists('user_profile.json'):
-        try:
-            with open('user_profile.json', 'r') as f:
-                data = json.load(f)
-            return UserProfile(**data)
-        except Exception as e:
-            logger.error(f"Error loading user_profile.json: {e}. Using defaults.")
-            return UserProfile()
-    return UserProfile()
-
-def save_profile(profile: UserProfile):
-    """Saves current profile behavior back to user_profile.json."""
-    try:
-        with open('user_profile.json', 'w') as f:
-            json.dump(profile.model_dump(), f, indent=4)
-    except Exception as e:
-        logger.error(f"Error saving user_profile.json: {e}")
-
-CONFIG = load_config()
-PROFILE = load_profile()
+# Global Instances
+CONFIG, PROFILE = load_state()
 STATE = SessionState()
