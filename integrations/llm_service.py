@@ -1,3 +1,4 @@
+from typing import Optional, List, Dict, Any
 import os
 import json
 import datetime
@@ -74,5 +75,59 @@ class LLMService:
             )
             return chat_completion.choices[0].message.content
         except Exception: return None
+
+    def transcribe_audio(self, audio_file_path: str) -> Optional[str]:
+        """
+        Transcribes voice notes or speech using Groq's high-speed Whisper Large v3.
+        """
+        if not self.client:
+            logger.error("Groq client not available for transcription")
+            return None
+        try:
+            with open(audio_file_path, "rb") as file:
+                transcription = self.client.audio.transcriptions.create(
+                    file=(os.path.basename(audio_file_path), file.read()),
+                    model="whisper-large-v3",
+                    response_format="text"
+                )
+                return str(transcription).strip()
+        except Exception as e:
+            logger.error(f"Whisper Transcription Error: {e}")
+            return None
+
+    def extract_multi_tasks(self, user_input: str) -> List[Dict[str, Any]]:
+        """
+        Extracts multiple task intents from a single brain dump or multi-step command.
+        Example: 'Gym at 7am, then sync with Alex at 11, and review budget at 4pm'
+        """
+        if not self.client:
+            return []
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        prompt = (
+            "You are lazy-scheduler, a strategic calendar partner.\n"
+            f"Reference Time: {now.strftime('%A, %b %d, %Y %I:%M %p')}\n\n"
+            "Analyze the user prompt. It may contain one or MULTIPLE scheduling requests.\n"
+            "Extract every distinct task into an array of objects under 'tasks'.\n\n"
+            "Each task object must have:\n"
+            "- title: string\n"
+            "- time_str: string\n"
+            "- duration_mins: integer (default 60)\n"
+            "- energy_cost: integer 1-5\n"
+            "- depends_on: prerequisite task title if sequential relationship ('then', 'after', 'before') exists\n\n"
+            "Return JSON: {\"tasks\": [...]}"
+        )
+
+        try:
+            chat_completion = self.client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt + f"\nUser: {user_input}"}],
+                model=self.model,
+                response_format={"type": "json_object"}
+            )
+            data = json.loads(chat_completion.choices[0].message.content)
+            return data.get("tasks", [])
+        except Exception as e:
+            logger.error(f"Multi-task Groq extraction error: {e}")
+            return []
 
 llm_service = LLMService()

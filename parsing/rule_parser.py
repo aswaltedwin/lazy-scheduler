@@ -45,9 +45,25 @@ class RuleBasedParser:
         elif "next week" in text:
             target_date = target_date + datetime.timedelta(days=7)
             
-        # 3. Time Extraction
+        # 3. Duration Extraction (e.g. 'for 45 mins', '45 mins', '1 hour')
+        duration_mins = 60
+        duration_pattern = re.search(r'\b(?:for\s+)?(\d+)\s*(mins?|minutes?|hrs?|hours?)\b', text, flags=re.IGNORECASE)
+        matched_duration_str = ""
+        if duration_pattern:
+            matched_duration_str = duration_pattern.group(0)
+            val = int(duration_pattern.group(1))
+            unit = duration_pattern.group(2).lower()
+            if "h" in unit:
+                duration_mins = val * 60
+            else:
+                duration_mins = val
+
+        # 4. Time Extraction
         start = target_date + datetime.timedelta(hours=1)
-        time_match = re.search(r'(\d{1,2}(?::\d{2})?\s*(?:am|pm|pm|am)?)', text)
+        time_match = re.search(r'\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b', text, flags=re.IGNORECASE)
+        if not time_match:
+            time_match = re.search(r'(?:at\s+)(\d{1,2}(?::\d{2})?)', text, flags=re.IGNORECASE)
+
         if time_match:
             try:
                 # Parse the time found in text
@@ -59,23 +75,27 @@ class RuleBasedParser:
                     start = start + datetime.timedelta(days=1)
             except Exception: pass
             
-        end = start + datetime.timedelta(hours=1)
+        end = start + datetime.timedelta(minutes=duration_mins)
 
-        # 4. Title Extraction
+        # 5. Title Extraction
         title = "New Task"
         clean_title = raw_text
         fillers = [
             "delete", "remove", "cancel", "clear", "update", "move", "change", 
             "at", "on", "tomorrow", "today", "my", "fully", "all", "everything", 
-            "session", "sessions", "when", "is", "there", "what", "find", "check", "good", "morning", "afternoon", "evening"
+            "session", "sessions", "when", "is", "there", "what", "find", "check", 
+            "good", "morning", "afternoon", "evening", "for"
         ]
+        if matched_duration_str:
+            clean_title = re.sub(re.escape(matched_duration_str), '', clean_title, flags=re.IGNORECASE)
+        if time_match:
+            clean_title = re.sub(re.escape(time_match.group(0)), '', clean_title, flags=re.IGNORECASE)
+
         for word in fillers:
             clean_title = re.sub(rf'\b{word}\b', '', clean_title, flags=re.IGNORECASE)
-        
-        if time_match:
-            clean_title = clean_title.replace(time_match.group(1), "")
             
-        title = clean_title.strip().title()
+        clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+        title = clean_title.title()
         if not title: title = "Untitled Task"
 
         if action == "delete" and any(w in text for w in ["everything", "all", "every"]):

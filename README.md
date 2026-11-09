@@ -48,11 +48,30 @@ Edit .env:
 GROQ_API_KEY=your_groq_api_key_here
 `
 
-### 4. Run LazyScheduler
+### 4. Run LazyScheduler (CLI)
 
 `ash
 python main.py
 `
+
+### 5. Run Web Dashboard & REST API (Optional)
+
+In addition to the interactive CLI, LazyScheduler includes a modern web dashboard and API:
+
+`ash
+uvicorn api:app --reload --port 8000
+`
+Open **http://localhost:8000** in your browser to view today\'s agenda, check day burnout risk, and schedule commands visually.
+
+### 6. Telegram Bot Integration (Optional)
+
+Configure your Telegram bot token and chat ID in .env:
+`ini
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+TELEGRAM_CHAT_ID=your_chat_id
+`
+Incoming messages forwarded to /api/telegram/webhook will automatically parse and schedule events.
+
 
 *On your first run, a browser window will open asking you to authenticate with your Google account. This saves your session token locally to 	oken.json for future seamless runs.*
 

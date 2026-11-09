@@ -93,11 +93,11 @@ class Orchestrator:
                     console.print(f"[bold yellow]Strategic Suggestion:[/bold yellow] '{task.title}' is a large goal. Should I break it down into these smaller steps?")
                     for sub in intelligence['sub_tasks']:
                         console.print(f" [dim]• {sub}[/dim]")
-                    if console.input("[bold cyan]Split this task? (y/n): [/bold cyan]").lower() == 'y':
-                        # In a full implementation, this would create multiple smaller tasks.
-                        # For now, we update the title to show it's focused.
-                        task.title = f"{task.title} (Part 1: {intelligence['sub_tasks'][0]})"
+                    task.sub_tasks_to_create = []
+                    if console.input("[bold cyan]Split this task into individual sessions? (y/n): [/bold cyan]").lower() == 'y':
                         task.is_decomposed = True
+                        task.sub_tasks_to_create = intelligence['sub_tasks']
+                        console.print(f"[green]Scheduling sub-tasks sequentially.[/green]")
 
                 # 3. Actions
                 if task.action in ["greet", "chat"]:
@@ -124,16 +124,33 @@ class Orchestrator:
                 conflicts = list_events(service, task.start, task.end)
 
                 if not conflicts:
-                    event_body = {
-                        'summary': task.title,
-                        'start': {'dateTime': task.start, 'timeZone': CONFIG.timezone},
-                        'end': {'dateTime': task.end, 'timeZone': CONFIG.timezone},
-                    }
-                    if task.recurrence: event_body['recurrence'] = task.recurrence
-                    create_event(service, event_body)
-                    Orchestrator.update_memory(task)
-                    console.print(f"[green]Added {task.title} to your calendar.[/green]")
-                    continue
+                    sub_tasks = getattr(task, 'sub_tasks_to_create', [])
+                    if task.is_decomposed and sub_tasks:
+                        curr_start = parser.parse(task.start)
+                        sub_duration = max(20, int(task.duration_mins / len(sub_tasks))) if task.duration_mins > 0 else 30
+                        for idx, sub_title in enumerate(sub_tasks, 1):
+                            curr_end = curr_start + datetime.timedelta(minutes=sub_duration)
+                            body = {
+                                'summary': f"{task.title}: {sub_title}",
+                                'start': {'dateTime': curr_start.isoformat(), 'timeZone': CONFIG.timezone},
+                                'end': {'dateTime': curr_end.isoformat(), 'timeZone': CONFIG.timezone},
+                            }
+                            create_event(service, body)
+                            console.print(f"[green]Added Sub-task #{idx} '{body['summary']}' ({curr_start.strftime('%I:%M %p')} - {curr_end.strftime('%I:%M %p')})[/green]")
+                            curr_start = curr_end
+                        Orchestrator.update_memory(task)
+                        continue
+                    else:
+                        event_body = {
+                            'summary': task.title,
+                            'start': {'dateTime': task.start, 'timeZone': CONFIG.timezone},
+                            'end': {'dateTime': task.end, 'timeZone': CONFIG.timezone},
+                        }
+                        if task.recurrence: event_body['recurrence'] = task.recurrence
+                        create_event(service, event_body)
+                        Orchestrator.update_memory(task)
+                        console.print(f"[green]Added {task.title} to your calendar.[/green]")
+                        continue
                 
                 # --- NEGOTIATION ---
                 console.print(f"[cyan]I found a conflict. Energy Fit Score: {round(task.momentum_score, 1)}[/cyan]")

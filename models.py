@@ -82,6 +82,7 @@ class EventDetails(BaseModel):
     effort: int = Field(3, description="Estimated effort: 1=Low, 3=Normal, 5=High")
     energy_cost: int = Field(3, description="Cognitive load: 1=Low, 3=Normal, 5=High")
     actual_duration: Optional[int] = Field(None, description="Actual time taken in minutes")
+    depends_on: Optional[str] = Field(None, description="Title or ID of prerequisite task")
     is_decomposed: bool = Field(False, description="Whether this task was split from a larger one")
     status: str = Field("pending", description="Task state: pending, completed, missed")
     intelligence: Optional[Dict[str, Any]] = Field(None, description="Extra LLM-extracted metadata")
